@@ -1,0 +1,28 @@
+{
+    "terminal.integrated.commandsToSkipShell": [
+        "_reload_configs",
+        "closeFindWidget",
+        "editor.action.goToTopHover",
+        "github.copilot.completions.toggle",
+        "leaveEditorMessage",
+        "remove-comments.removeAllComments",
+        "search.action.clearSearchResults",
+        "superkeys.loadConfigs",
+        "superkeys.openView",
+        "superkeys.runView",
+        "workbench.action.closeAllEditors",
+        "workbench.action.closeAuxiliaryBar",
+        "workbench.action.closeOtherEditors",
+        "workbench.action.reloadWindow",
+        "workbench.action.tasks.runTask",
+        "workbench.action.tasks.terminate",
+        "workbench.action.terminal.focus",
+        "workbench.action.terminal.killAll",
+        "workbench.action.terminal.new",
+        "workbench.action.terminal.sendSequence",
+        "workbench.action.zoomIn",
+        "workbench.action.zoomOut",
+        "workbench.files.action.collapseExplorerFolders",
+        "workbench.files.action.focusFilesExplorer"
+    ]
+}
