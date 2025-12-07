@@ -1,5 +1,5 @@
 """
-Minimal 2D FFT Gravity Simulation
+Dimension Agnostic FFT Gravity
 """
 
 import numpy as np
@@ -13,15 +13,19 @@ class Simulation(mglw.WindowConfig):
     gl_version = (4, 6)
     title = "FFT Gravity"
     window_size = (1024, 1024)
-    aspect_ratio = 1.0
-    resizable = False
+    aspect_ratio = 1.0  # <--- ADD THIS LINE BACK
+    resizable = True  # You can keep this true if you want
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # FORCE the window to use this class's key_event handler
         self.wnd.key_event_func = self.key_event
-
         self.cfg = self.load_config()
+
+        # --- NEW: Dimension Setup ---
+        self.dim = self.cfg.get("dimensions", 2)
+        if self.dim > 3:
+            raise NotImplementedError("OpenGL natively supports up to 3D textures.")
+
         self.timescale = 1.0
         self.paused = False
 
@@ -39,11 +43,11 @@ class Simulation(mglw.WindowConfig):
         self.init_render()
 
     def load_config(self):
+        # (Same as before)
         cfg_path = Path(__file__).parent / "config.yaml"
         if cfg_path.exists():
             with open(cfg_path) as f:
                 return yaml.safe_load(f)
-        # defaults
         return {
             "grid_size": 128,
             "world_size": 100.0,
@@ -51,32 +55,46 @@ class Simulation(mglw.WindowConfig):
             "G": 1.0,
             "dt": 0.016,
             "particle_mass": 1.0,
+            "dimensions": 2,
         }
 
     def init_buffers(self):
-        # Particle positions (x, y, z, mass) - z=0 for 2D
+        # Particles are vec4 (x,y,z,w). This works for 2D (z=0) and 3D.
         self.pos_buf = self.ctx.buffer(reserve=self.num_particles * 16)
-        # Particle velocities (vx, vy, vz, unused)
         self.vel_buf = self.ctx.buffer(reserve=self.num_particles * 16)
 
     def init_textures(self):
         gs = self.grid_size
-        # Mass texture (r32ui) - but moderngl doesn't support r32ui well, use r32f
-        self.mass_tex = self.ctx.texture((gs, gs), 1, dtype="f4")
-        # Complex textures for FFT ping-pong (rg32f)
-        self.complex_tex_a = self.ctx.texture((gs, gs), 2, dtype="f4")
-        self.complex_tex_b = self.ctx.texture((gs, gs), 2, dtype="f4")
-        # Gradient texture (rgba32f) - gradient.xy + magnitude
-        self.gradient_tex = self.ctx.texture((gs, gs), 4, dtype="f4")
+        # Dynamic tuple for dimensions: (gs, gs) or (gs, gs, gs)
+        size = tuple([gs] * self.dim)
 
-        # For atomic mass accumulation, we need a buffer instead
-        self.mass_buf = self.ctx.buffer(reserve=gs * gs * 4)
+        # Helper to create correct texture type
+        def create_tex(channels):
+            if self.dim == 2:
+                return self.ctx.texture(size, channels, dtype="f4")
+            elif self.dim == 3:
+                return self.ctx.texture3d(size, channels, dtype="f4")
+
+        self.mass_tex = create_tex(1)
+        self.complex_tex_a = create_tex(2)
+        self.complex_tex_b = create_tex(2)
+        self.gradient_tex = create_tex(4)  # stores grad.xyz + magnitude
+
+        # Buffer size depends on total voxels
+        total_voxels = gs**self.dim
+        self.mass_buf = self.ctx.buffer(reserve=total_voxels * 4)
 
     def init_shaders(self):
         shader_dir = Path(__file__).parent / "shaders"
 
+        # --- NEW: Inject Dimension Macro ---
         def load(name):
-            return (shader_dir / name).read_text()
+            src = (shader_dir / name).read_text()
+            # Inject definition after #version
+            header = f"#version 460\n#define DIM {self.dim}\n"
+            # Remove original #version from file if present to avoid errors
+            src = src.replace("#version 460", "")
+            return header + src
 
         self.prog_mass = self.ctx.compute_shader(load("mass.glsl"))
         self.prog_complex = self.ctx.compute_shader(load("complex.glsl"))
@@ -90,144 +108,164 @@ class Simulation(mglw.WindowConfig):
         pos = np.zeros((self.num_particles, 4), dtype="f4")
         vel = np.zeros((self.num_particles, 4), dtype="f4")
 
-        # Uniform distribution across the whole world_size
-        # x, y coordinates
-        pos[:, 0] = np.random.uniform(0, self.world_size, self.num_particles)
-        pos[:, 1] = np.random.uniform(0, self.world_size, self.num_particles)
-        pos[:, 2] = 0  # z = 0 for 2D
-        pos[:, 3] = self.cfg["particle_mass"]  # mass
+        # Randomize based on dimensions
+        for i in range(self.dim):
+            pos[:, i] = np.random.uniform(0, self.world_size, self.num_particles)
+            vel[:, i] = np.random.uniform(-1.0, 1.0, self.num_particles)
 
-        # Random velocities (thermal noise)
-        # Small values so they drift rather than orbit immediately
-        vel[:, 0] = np.random.uniform(-1.0, 1.0, self.num_particles)
-        vel[:, 1] = np.random.uniform(-1.0, 1.0, self.num_particles)
+        # Mass
+        pos[:, 3] = self.cfg["particle_mass"]
 
         self.pos_buf.write(pos.tobytes())
         self.vel_buf.write(vel.tobytes())
 
     def init_render(self):
-        # Simple point rendering
+        # Basic perspective for 3D, ortho for 2D
+        # (Simplified for brevity - assumes you want to see a slice or projection)
         self.render_prog = self.ctx.program(
             vertex_shader="""
             #version 460
             layout(location = 0) in vec4 in_pos;
             uniform float world_size;
+            uniform int dim;
+            
             void main() {
-                vec2 ndc = (in_pos.xy / world_size) * 2.0 - 1.0;
-                gl_Position = vec4(ndc, 0.0, 1.0);
-                gl_PointSize = 2.0;
+                // Normalize 0..world_size to -1..1
+                vec3 p = (in_pos.xyz / world_size) * 2.0 - 1.0;
+                
+                if (dim == 3) {
+                    // Simple perspective projection trick
+                    float z = p.z + 2.0; // move camera back
+                    gl_Position = vec4(p.x, p.y, 0.0, z); 
+                    gl_PointSize = 4.0 / z; // depth scaling
+                } else {
+                    gl_Position = vec4(p.xy, 0.0, 1.0);
+                    gl_PointSize = 2.0;
+                }
             }
             """,
             fragment_shader="""
             #version 460
             out vec4 fragColor;
-            void main() {
-                fragColor = vec4(1.0, 1.0, 1.0, 1.0);
-            }
+            void main() { fragColor = vec4(1.0, 0.8, 0.5, 1.0); }
             """,
         )
         self.render_prog["world_size"] = self.world_size
+        self.render_prog["dim"] = self.dim
         self.vao = self.ctx.vertex_array(
             self.render_prog, [(self.pos_buf, "4f", "in_pos")]
         )
 
     def clear_mass(self):
-        # Zero out mass buffer (uint)
-        zeros = np.zeros(self.grid_size * self.grid_size, dtype="u4")
+        total_voxels = self.grid_size**self.dim
+        zeros = np.zeros(total_voxels, dtype="u4")
         self.mass_buf.write(zeros.tobytes())
 
     def run_fft(self, forward=True):
-        """Run 2D FFT on complex_tex_a, result in complex_tex_a"""
         gs = self.grid_size
         num_stages = int(np.log2(gs))
         direction = 1 if forward else -1
 
         src, dst = self.complex_tex_a, self.complex_tex_b
 
-        for axis in range(2):  # X then Y
+        # This works for 2, 3, (or 4 conceptually) dimensions automatically
+        for axis in range(self.dim):
             self.prog_fft["direction"] = direction
             self.prog_fft["axis"] = axis
-            self.prog_fft["tensorDimensions"] = (gs, gs, 1)
 
-            for stage in range(num_stages + 1):  # 0 = bit reversal, 1..n = butterflies
+            # Setup tuple for uniform: (gs, gs, 1) or (gs, gs, gs)
+            dims = tuple([gs] * self.dim) + ((1,) if self.dim == 2 else ())
+            self.prog_fft["tensorDimensions"] = dims
+
+            for stage in range(num_stages + 1):
                 self.prog_fft["stage"] = stage
-
                 src.bind_to_image(0, read=True, write=False)
                 dst.bind_to_image(1, read=False, write=True)
 
-                self.prog_fft.run(gs // 8, gs // 8, 1)
-                self.ctx.memory_barrier()
+                # Dispatch
+                # 2D: (gs/8, gs/8, 1)
+                # 3D: (gs/8, gs/8, gs)
+                z_groups = gs if self.dim == 3 else 1
+                self.prog_fft.run(gs // 8, gs // 8, z_groups)
 
+                self.ctx.memory_barrier()
                 src, dst = dst, src
 
-        # Result is in src after all swaps
+        # Ensure result ends in tex_a
         if src != self.complex_tex_a:
-            # Copy back if needed (or just track which is "current")
+            # For strictness, you'd copy. For this demo, we just swap refs in step().
             pass
 
     def step(self):
         gs = self.grid_size
+        dims = tuple([gs] * self.dim) + ((1,) if self.dim == 2 else ())
         n_particles = self.num_particles
 
-        # 1. Clear and deposit mass
+        # Helper for dispatching 2D vs 3D grids
+        def dispatch_grid():
+            z = gs if self.dim == 3 else 1
+            return (gs // 8, gs // 8, z)
+
+        # 1. Clear Mass
         self.clear_mass()
         self.pos_buf.bind_to_storage_buffer(0)
         self.mass_buf.bind_to_storage_buffer(1)
-        self.prog_mass["tensorDimensions"] = (gs, gs, 1)
+        self.prog_mass["tensorDimensions"] = dims
         self.prog_mass["voxelSize"] = self.voxel_size
         self.prog_mass.run((n_particles + 255) // 256)
         self.ctx.memory_barrier()
 
-        # 2. Mass buffer -> complex texture
+        # 2. Mass -> Complex
         self.mass_buf.bind_to_storage_buffer(0)
         self.complex_tex_a.bind_to_image(1, read=False, write=True)
-        self.prog_complex["tensorDimensions"] = (gs, gs, 1)
-        self.prog_complex.run(gs // 8, gs // 8, 1)
+        self.prog_complex["tensorDimensions"] = dims
+        self.prog_complex.run(*dispatch_grid())
         self.ctx.memory_barrier()
 
-        # 3. Forward FFT
+        # 3. FFT
         self.run_fft(forward=True)
 
-        # 4. Green's function (multiply by -4πG/k²)
+        # 4. Greens
         self.complex_tex_a.bind_to_image(0, read=True, write=False)
         self.complex_tex_b.bind_to_image(1, read=False, write=True)
-        self.prog_greens["tensorDimensions"] = (gs, gs, 1)
+        self.prog_greens["tensorDimensions"] = dims
         self.prog_greens["G"] = self.G
         self.prog_greens["worldSize"] = self.world_size
-        self.prog_greens.run(gs // 8, gs // 8, 1)
+        self.prog_greens.run(*dispatch_grid())
         self.ctx.memory_barrier()
 
-        # Swap so potential is in tex_a
+        # Swap
         self.complex_tex_a, self.complex_tex_b = self.complex_tex_b, self.complex_tex_a
 
-        # 5. Inverse FFT
+        # 5. IFFT
         self.run_fft(forward=False)
 
         # 6. Normalize
         self.complex_tex_a.bind_to_image(0, read=True, write=True)
-        self.prog_normalize["tensorDimensions"] = (gs, gs, 1)
-        self.prog_normalize.run(gs // 8, gs // 8, 1)
+        self.prog_normalize["tensorDimensions"] = dims
+        self.prog_normalize.run(*dispatch_grid())
         self.ctx.memory_barrier()
 
         # 7. Gradient
         self.complex_tex_a.bind_to_image(0, read=True, write=False)
         self.gradient_tex.bind_to_image(1, read=False, write=True)
-        self.prog_gradient["tensorDimensions"] = (gs, gs, 1)
+        self.prog_gradient["tensorDimensions"] = dims
         self.prog_gradient["voxelSize"] = self.voxel_size
-        self.prog_gradient.run(gs // 8, gs // 8, 1)
+        self.prog_gradient.run(*dispatch_grid())
         self.ctx.memory_barrier()
 
-        # 8. Update particles
+        # 8. Update Particles
         self.pos_buf.bind_to_storage_buffer(0)
         self.vel_buf.bind_to_storage_buffer(1)
         self.gradient_tex.bind_to_image(0, read=True, write=False)
         self.prog_update["deltaTime"] = self.dt * self.timescale
-        self.prog_update["tensorDimensions"] = (gs, gs, 1)
+        self.prog_update["tensorDimensions"] = dims
         self.prog_update["worldSize"] = self.world_size
         self.prog_update["voxelSize"] = self.voxel_size
         self.prog_update.run((n_particles + 255) // 256)
         self.ctx.memory_barrier()
 
+    # ... key_event and on_render remain similar ...
     def on_render(self, time, frame_time):
         if not self.paused:
             self.step()

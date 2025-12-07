@@ -1,13 +1,23 @@
 #version 460
-layout(local_size_x = 8, local_size_y = 8) in;
+// Injected by Python: #define DIM 2 or #define DIM 3
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(location = 0) uniform ivec3 tensorDimensions;
 layout(location = 1) uniform int stage;
-layout(location = 2) uniform int direction; // 1 forward, -1 inverse
-layout(location = 3) uniform int axis;      // 0 for X, 1 for Y
+layout(location = 2) uniform int direction;
+layout(location = 3) uniform int axis; // 0=X, 1=Y, 2=Z
 
+// --- AGNOSTIC TYPES ---
+#if DIM == 3
+#define IVEC_TYPE ivec3
+layout(rg32f, binding = 0) readonly uniform image3D inputTexture;
+layout(rg32f, binding = 1) writeonly uniform image3D outputTexture;
+#else
+#define IVEC_TYPE ivec2
 layout(rg32f, binding = 0) readonly uniform image2D inputTexture;
 layout(rg32f, binding = 1) writeonly uniform image2D outputTexture;
+#endif
+// ----------------------
 
 const float PI = 3.14159265359;
 const float PI2 = 2.0 * PI;
@@ -22,9 +32,11 @@ vec2 compute_twiddle(int k, int stageSize) {
   if (k == stageSize / 2)
     return vec2(-1.0, 0.0);
 
-  float phase = -direction * PI2 * float(k) / float(stageSize);
+  float phase = -float(direction) * PI2 * float(k) / float(stageSize);
   float c = cos(phase);
   float s = sin(phase);
+
+  // Numerical stability
   if (abs(c) < 1e-6)
     c = 0.0;
   if (abs(s) < 1e-6)
@@ -32,17 +44,43 @@ vec2 compute_twiddle(int k, int stageSize) {
   return vec2(c, s);
 }
 
-int get_axis_index(ivec2 pos) { return (axis == 0) ? pos.x : pos.y; }
-
-ivec2 set_axis_index(ivec2 pos, int idx) {
+// --- INDEXING HELPERS ---
+int get_axis_index(IVEC_TYPE pos) {
   if (axis == 0)
-    return ivec2(idx, pos.y);
-  return ivec2(pos.x, idx);
+    return pos.x;
+  if (axis == 1)
+    return pos.y;
+#if DIM == 3
+  if (axis == 2)
+    return pos.z;
+#endif
+  return 0;
+}
+
+IVEC_TYPE set_axis_index(IVEC_TYPE pos, int idx) {
+  if (axis == 0)
+    pos.x = idx;
+  else if (axis == 1)
+    pos.y = idx;
+#if DIM == 3
+  else if (axis == 2)
+    pos.z = idx;
+#endif
+  return pos;
 }
 
 int get_axis_size() {
-  return (axis == 0) ? tensorDimensions.x : tensorDimensions.y;
+  if (axis == 0)
+    return tensorDimensions.x;
+  if (axis == 1)
+    return tensorDimensions.y;
+#if DIM == 3
+  if (axis == 2)
+    return tensorDimensions.z;
+#endif
+  return tensorDimensions.x;
 }
+// ------------------------
 
 uint bit_reverse(uint x, uint n) {
   uint result = 0;
@@ -54,12 +92,21 @@ uint bit_reverse(uint x, uint n) {
 }
 
 void main() {
-  ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+  // 1. Get agnostic coordinate
+  IVEC_TYPE pos = IVEC_TYPE(gl_GlobalInvocationID);
+
+// 2. Bounds check (agnostic)
+#if DIM == 3
+  if (any(greaterThanEqual(pos, tensorDimensions)))
+    return;
+#else
   if (any(greaterThanEqual(pos, tensorDimensions.xy)))
     return;
+#endif
 
   int axisSize = get_axis_size();
   int axisIndex = get_axis_index(pos);
+
   if (axisIndex >= axisSize)
     return;
 
@@ -68,7 +115,7 @@ void main() {
   // Stage 0: Bit reversal
   if (stage == 0) {
     uint revIndex = bit_reverse(uint(axisIndex), n);
-    ivec2 revPos = set_axis_index(pos, int(revIndex));
+    IVEC_TYPE revPos = set_axis_index(pos, int(revIndex));
     vec2 val = imageLoad(inputTexture, pos).xy;
     imageStore(outputTexture, revPos, vec4(val, 0.0, 0.0));
     return;
@@ -88,8 +135,8 @@ void main() {
   if (i2 >= axisSize)
     return;
 
-  ivec2 pos1 = set_axis_index(pos, i1);
-  ivec2 pos2 = set_axis_index(pos, i2);
+  IVEC_TYPE pos1 = set_axis_index(pos, i1);
+  IVEC_TYPE pos2 = set_axis_index(pos, i2);
 
   vec2 p = imageLoad(inputTexture, pos1).xy;
   vec2 q = imageLoad(inputTexture, pos2).xy;
@@ -102,9 +149,6 @@ void main() {
   if (abs(temp.y) < 1e-6)
     temp.y = 0.0;
 
-  vec2 P = p + temp;
-  vec2 Q = p - temp;
-
-  imageStore(outputTexture, pos1, vec4(P, 0.0, 0.0));
-  imageStore(outputTexture, pos2, vec4(Q, 0.0, 0.0));
+  imageStore(outputTexture, pos1, vec4(p + temp, 0.0, 0.0));
+  imageStore(outputTexture, pos2, vec4(p - temp, 0.0, 0.0));
 }
