@@ -1,0 +1,6 @@
+grid_size: 2048        # Must be power of 2
+world_size: 1000.0
+num_particles: 1e6
+G: 0.5
+dt: 0.01
+particle_mass: 1.0
