@@ -1,7 +1,7 @@
 dimensions: 2
-grid_size: 256
-world_size: 100000.0
-num_particles: 1e6
-G: 0.5
+grid_size: 128
+world_size: 1000.0
+num_particles: 1e5
+G: 0.1
 dt: 0.01
 particle_mass: 1.0

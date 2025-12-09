@@ -125,12 +125,27 @@ void main() {
   int stageSize = 1 << stage;
   int halfStageSize = stageSize >> 1;
 
-  int group = axisIndex / stageSize;
-  int pairOffset = axisIndex % halfStageSize;
-  int k = pairOffset;
+  // [FIX 1] Eliminate Race Condition:
+  // We only need N/2 threads. If index is in the second half, kill it.
+  if (axisIndex >= axisSize / 2)
+    return;
 
-  int i1 = group * stageSize + pairOffset;
+  // [FIX 2] Correct Cooley-Tukey Index Mapping:
+  // Map the linear thread ID (0..N/2) to the correct butterfly indices.
+  // "t" acts as the unique thread identifier.
+  int t = axisIndex;
+  int i1 = (t / halfStageSize) * stageSize + (t % halfStageSize);
   int i2 = i1 + halfStageSize;
+
+  // The twiddle factor 'k' is the offset within the group
+  int k = t % halfStageSize;
+
+  // int group = axisIndex / stageSize;
+  // int pairOffset = axisIndex % halfStageSize;
+  // int k = pairOffset;
+
+  // int i1 = group * stageSize + pairOffset;
+  // int i2 = i1 + halfStageSize;
 
   if (i2 >= axisSize)
     return;
