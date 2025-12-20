@@ -96,8 +96,6 @@ class Simulation(mglw.WindowConfig):
         self.cam_dist = 3.0
         self.mouse_pressed = False
         self.show_grid_debug = False
-        self.debug_grid_index = -1  # -1 = all grids, 0-7 = specific grid
-        self.show_grid_internals = False  # Show internal cell divisions
 
         effective_res = self.grid_size * self.n_grids
         total_cells = self.n_grids * (self.grid_size**self.dim)
@@ -417,9 +415,8 @@ class Simulation(mglw.WindowConfig):
         self.init_grid_debug_geometry()
 
     def init_grid_debug_geometry(self):
-        """Create grid line geometry for debug visualization."""
+        """Create single-cell geometry for each grid to visualize offsets and rotations."""
 
-        # Generate distinct colors for each grid using golden ratio hue
         def hsv_to_rgb(h, s, v):
             i = int(h * 6)
             f = h * 6 - i
@@ -437,123 +434,114 @@ class Simulation(mglw.WindowConfig):
                 return (t, p, v)
             return (v, p, q)
 
-        gs = self.grid_size
         vs = self.voxel_size
-        ws = self.world_size
+        center = self.world_size / 2.0
 
-        # Store per-grid geometry for selective rendering
-        # Each grid has two VAOs: outline only, and full internals
-        self.grid_debug_vaos = []  # Outline only
-        self.grid_debug_internal_vaos = []  # Full internal grid lines
-        self.grid_debug_bufs = []
+        positions = []
+        colors = []
 
         for grid_idx in range(self.n_grids):
-            # Golden ratio color generation for distinct colors
             hue = (grid_idx * 0.618033988749895) % 1.0
             r, g, b = hsv_to_rgb(hue, 0.8, 0.9)
             color = (r, g, b)
             offset = self.offsets[grid_idx][: self.dim]
 
-            # Outline geometry
-            outline_positions = []
-            outline_colors = []
-
-            # Internal geometry (includes outline + all cell divisions)
-            internal_positions = []
-            internal_colors = []
+            # Extract rotation matrix from packed format
+            rot_data = self.rotations[grid_idx]
 
             if self.dim == 2:
-                # For 2D, outline and internal are the same (grid lines)
-                for i in range(gs + 1):
-                    y = (i * vs + offset[1]) % ws
-                    internal_positions.extend([[0, y, 0], [ws, y, 0]])
-                    internal_colors.extend([color, color])
-                for i in range(gs + 1):
-                    x = (i * vs + offset[0]) % ws
-                    internal_positions.extend([[x, 0, 0], [x, ws, 0]])
-                    internal_colors.extend([color, color])
-                outline_positions = internal_positions
-                outline_colors = internal_colors
-            else:  # 3D
-                ox, oy, oz = offset[0], offset[1], offset[2]
+                # Unpack mat2 (column-major): col0 at [0:2], col1 at [4:6]
+                rot = np.array([
+                    [rot_data[0], rot_data[4]],
+                    [rot_data[1], rot_data[5]]
+                ], dtype="f4")
 
-                # Outline: just the 12 edges of the cube
-                outline_positions.extend([[ox, oy, oz], [ox + ws, oy, oz]])
-                outline_positions.extend([[ox, oy, oz], [ox, oy + ws, oz]])
-                outline_positions.extend([[ox + ws, oy, oz], [ox + ws, oy + ws, oz]])
-                outline_positions.extend([[ox, oy + ws, oz], [ox + ws, oy + ws, oz]])
-                outline_positions.extend([[ox, oy, oz + ws], [ox + ws, oy, oz + ws]])
-                outline_positions.extend([[ox, oy, oz + ws], [ox, oy + ws, oz + ws]])
-                outline_positions.extend(
-                    [[ox + ws, oy, oz + ws], [ox + ws, oy + ws, oz + ws]]
-                )
-                outline_positions.extend(
-                    [[ox, oy + ws, oz + ws], [ox + ws, oy + ws, oz + ws]]
-                )
-                outline_positions.extend([[ox, oy, oz], [ox, oy, oz + ws]])
-                outline_positions.extend([[ox + ws, oy, oz], [ox + ws, oy, oz + ws]])
-                outline_positions.extend([[ox, oy + ws, oz], [ox, oy + ws, oz + ws]])
-                outline_positions.extend(
-                    [[ox + ws, oy + ws, oz], [ox + ws, oy + ws, oz + ws]]
-                )
-                outline_colors.extend([color] * 24)
+                # Define unit cell corners centered at origin
+                corners = np.array([
+                    [0, 0],
+                    [vs, 0],
+                    [vs, vs],
+                    [0, vs],
+                ], dtype="f4")
 
-                # Internal: all cell division lines
-                for iy in range(gs + 1):
-                    for iz in range(gs + 1):
-                        y = (iy * vs + offset[1]) % ws
-                        z = (iz * vs + offset[2]) % ws
-                        internal_positions.extend([[0, y, z], [ws, y, z]])
-                        internal_colors.extend([color, color])
-                for ix in range(gs + 1):
-                    for iz in range(gs + 1):
-                        x = (ix * vs + offset[0]) % ws
-                        z = (iz * vs + offset[2]) % ws
-                        internal_positions.extend([[x, 0, z], [x, ws, z]])
-                        internal_colors.extend([color, color])
-                for ix in range(gs + 1):
-                    for iy in range(gs + 1):
-                        x = (ix * vs + offset[0]) % ws
-                        y = (iy * vs + offset[1]) % ws
-                        internal_positions.extend([[x, y, 0], [x, y, ws]])
-                        internal_colors.extend([color, color])
+                # Rotate corners around cell center, then translate
+                cell_center = np.array([vs / 2, vs / 2], dtype="f4")
+                rotated_corners = []
+                for c in corners:
+                    local = c - cell_center
+                    rotated = rot @ local
+                    world = rotated + cell_center + np.array([center + offset[0], center + offset[1]], dtype="f4")
+                    rotated_corners.append(world)
 
-            # Create outline VAO
-            outline_positions = np.array(outline_positions, dtype="f4")
-            outline_colors = np.array(outline_colors, dtype="f4")
-            outline_pos_buf = self.ctx.buffer(outline_positions.tobytes())
-            outline_color_buf = self.ctx.buffer(outline_colors.tobytes())
-            outline_vao = self.ctx.vertex_array(
-                self.grid_debug_prog,
-                [
-                    (outline_pos_buf, "3f", "in_pos"),
-                    (outline_color_buf, "3f", "in_color"),
-                ],
-            )
-            self.grid_debug_vaos.append(outline_vao)
+                # Draw square outline (4 edges)
+                positions.extend([
+                    [rotated_corners[0][0], rotated_corners[0][1], 0],
+                    [rotated_corners[1][0], rotated_corners[1][1], 0],
+                    [rotated_corners[1][0], rotated_corners[1][1], 0],
+                    [rotated_corners[2][0], rotated_corners[2][1], 0],
+                    [rotated_corners[2][0], rotated_corners[2][1], 0],
+                    [rotated_corners[3][0], rotated_corners[3][1], 0],
+                    [rotated_corners[3][0], rotated_corners[3][1], 0],
+                    [rotated_corners[0][0], rotated_corners[0][1], 0],
+                ])
+                colors.extend([color] * 8)
+            else:
+                # Unpack mat3 (column-major): col0 at [0:3], col1 at [4:7], col2 at [8:11]
+                rot = np.array([
+                    [rot_data[0], rot_data[4], rot_data[8]],
+                    [rot_data[1], rot_data[5], rot_data[9]],
+                    [rot_data[2], rot_data[6], rot_data[10]]
+                ], dtype="f4")
 
-            # Create internal VAO
-            internal_positions = np.array(internal_positions, dtype="f4")
-            internal_colors = np.array(internal_colors, dtype="f4")
-            internal_pos_buf = self.ctx.buffer(internal_positions.tobytes())
-            internal_color_buf = self.ctx.buffer(internal_colors.tobytes())
-            internal_vao = self.ctx.vertex_array(
-                self.grid_debug_prog,
-                [
-                    (internal_pos_buf, "3f", "in_pos"),
-                    (internal_color_buf, "3f", "in_color"),
-                ],
-            )
-            self.grid_debug_internal_vaos.append(internal_vao)
+                # Define unit cube corners centered at origin
+                corners = np.array([
+                    [0, 0, 0],
+                    [vs, 0, 0],
+                    [0, vs, 0],
+                    [vs, vs, 0],
+                    [0, 0, vs],
+                    [vs, 0, vs],
+                    [0, vs, vs],
+                    [vs, vs, vs],
+                ], dtype="f4")
 
-            self.grid_debug_bufs.append(
-                (
-                    outline_pos_buf,
-                    outline_color_buf,
-                    internal_pos_buf,
-                    internal_color_buf,
-                )
-            )
+                # Rotate corners around cell center, then translate
+                cell_center = np.array([vs / 2, vs / 2, vs / 2], dtype="f4")
+                world_offset = np.array([center + offset[0], center + offset[1], center + offset[2]], dtype="f4")
+                rotated_corners = []
+                for c in corners:
+                    local = c - cell_center
+                    rotated = rot @ local
+                    world = rotated + cell_center + world_offset
+                    rotated_corners.append(world)
+
+                # 12 edges of a cube using corner indices
+                # Corners: 0=(0,0,0), 1=(1,0,0), 2=(0,1,0), 3=(1,1,0),
+                #          4=(0,0,1), 5=(1,0,1), 6=(0,1,1), 7=(1,1,1)
+                edges = [
+                    (0, 1), (0, 2), (0, 4),  # from corner 0
+                    (1, 3), (1, 5),           # from corner 1
+                    (2, 3), (2, 6),           # from corner 2
+                    (3, 7),                   # from corner 3
+                    (4, 5), (4, 6),           # from corner 4
+                    (5, 7), (6, 7),           # from corners 5, 6
+                ]
+                for i, j in edges:
+                    positions.extend([
+                        list(rotated_corners[i]),
+                        list(rotated_corners[j]),
+                    ])
+                colors.extend([color] * 24)
+
+        positions = np.array(positions, dtype="f4")
+        colors = np.array(colors, dtype="f4")
+        pos_buf = self.ctx.buffer(positions.tobytes())
+        color_buf = self.ctx.buffer(colors.tobytes())
+        self.grid_debug_vao = self.ctx.vertex_array(
+            self.grid_debug_prog,
+            [(pos_buf, "3f", "in_pos"), (color_buf, "3f", "in_color")],
+        )
+        self.grid_debug_bufs = [pos_buf, color_buf]
 
     def clear_mass(self):
         """Clear all grid mass buffers."""
@@ -833,18 +821,7 @@ class Simulation(mglw.WindowConfig):
         if self.show_grid_debug:
             self.grid_debug_prog["m_view"].write(m_view.tobytes())
             self.grid_debug_prog["m_proj"].write(m_proj.tobytes())
-            vaos = (
-                self.grid_debug_internal_vaos
-                if self.show_grid_internals
-                else self.grid_debug_vaos
-            )
-            if self.debug_grid_index < 0:
-                # Render all grids
-                for vao in vaos:
-                    vao.render(moderngl.LINES)
-            else:
-                # Render single grid
-                vaos[self.debug_grid_index].render(moderngl.LINES)
+            self.grid_debug_vao.render(moderngl.LINES)
 
     def on_key_event(self, key, action, modifiers):
         keys = self.wnd.keys
@@ -873,32 +850,9 @@ class Simulation(mglw.WindowConfig):
                 self.timescale *= 1.5
                 print(f"Timescale: {self.timescale:.4f}")
 
-            elif key == keys.NUMBER_1:
+            elif key == keys.G:
                 self.show_grid_debug = not self.show_grid_debug
                 print(f"Grid debug: {'ON' if self.show_grid_debug else 'OFF'}")
-
-            elif key == keys.NUMBER_0:
-                self.debug_grid_index = -1
-                print("Showing all grids")
-
-            elif key in [
-                keys.NUMBER_2,
-                keys.NUMBER_3,
-                keys.NUMBER_4,
-                keys.NUMBER_5,
-                keys.NUMBER_6,
-                keys.NUMBER_7,
-                keys.NUMBER_8,
-                keys.NUMBER_9,
-            ]:
-                idx = key - keys.NUMBER_2  # 0-7
-                if idx < self.n_grids:
-                    self.debug_grid_index = idx
-                    print(f"Showing grid {idx}")
-
-            elif key == 96:  # ` key (glfw.KEY_GRAVE_ACCENT)
-                self.show_grid_internals = not self.show_grid_internals
-                print(f"Grid internals: {'ON' if self.show_grid_internals else 'OFF'}")
 
 
 if __name__ == "__main__":
