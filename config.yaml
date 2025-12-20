@@ -1,6 +1,6 @@
 dimensions: 3
 # Linear-Sparse-Grid Configuration
-n_grids: 32            # Number of offset grids (reduced for 3D memory)
+n_grids: 64            # Number of offset grids (reduced for 3D memory)
 grid_size: 16         # Base resolution per grid (32x32x32)
 world_size: 100.0
 num_particles: 1e5
