@@ -153,73 +153,120 @@ class Simulation(mglw.WindowConfig):
         self.prog_fft = self.ctx.compute_shader(load("fft.glsl"))
         self.prog_greens = self.ctx.compute_shader(load("greens.glsl"))
 
-        self.prog_normalize = self.ctx.compute_shader(load("normalize.glsl"))
+        self.prog_fourier = self.ctx.compute_shader(load("fourier.glsl"))
         self.prog_update = self.ctx.compute_shader(load("update.glsl"))
 
         self.prog_pack = self.ctx.compute_shader(load("pack.glsl"))
 
     def init_particles(self):
-        """Initialize particles in planetary orbital configuration."""
+        """Initialize particles using multi-octave Perlin noise with randomized parameters."""
         pos = np.zeros((self.num_particles, 4), dtype="f4")
         vel = np.zeros((self.num_particles, 4), dtype="f4")
 
-        center = self.world_size / 2.0
+        # Randomize Perlin parameters
+        num_octaves = np.random.randint(2, 6)
+        base_freq = np.random.uniform(0.5, 4.0)
+        lacunarity = np.random.uniform(1.5, 3.0)  # Frequency multiplier per octave
+        persistence = np.random.uniform(0.3, 0.7)  # Amplitude multiplier per octave
+        noise_strength = np.random.uniform(0.2, 0.5) * self.world_size
 
-        # Central massive body (or cluster of heavy particles)
-        num_central = max(1, self.num_particles // 100)  # 1% as central mass
-        central_mass = self.cfg["particle_mass"] * 100  # Much heavier
+        # Random offset so each run looks different
+        offset = np.random.uniform(0, 1000, size=self.dim)
 
-        for i in range(num_central):
-            pos[i, : self.dim] = center + np.random.normal(
-                0, self.world_size * 0.01, self.dim
+        def perlin_octaves(coords):
+            """Sample multi-octave Perlin noise at given coordinates."""
+            total = np.zeros(len(coords))
+            freq = base_freq
+            amp = 1.0
+            max_amp = 0.0
+
+            for _ in range(num_octaves):
+                # Perlin-like noise using sin of multiple frequencies
+                noise = np.ones(len(coords))
+                for d in range(coords.shape[1]):
+                    noise *= np.sin(freq * coords[:, d] + offset[d])
+                    noise += np.cos(freq * 1.7 * coords[:, d] + offset[d] * 0.7)
+                total += noise * amp
+                max_amp += amp
+                freq *= lacunarity
+                amp *= persistence
+
+            return total / max_amp
+
+        # Generate base positions - uniform random or grid with jitter
+        if np.random.random() < 0.5:
+            # Uniform random base
+            base_pos = (
+                np.random.uniform(0.1, 0.9, (self.num_particles, self.dim))
+                * self.world_size
             )
-            vel[i, : self.dim] = 0.0  # Central mass stationary
-            pos[i, 3] = central_mass
+        else:
+            # Jittered grid base
+            n_side = int(np.ceil(self.num_particles ** (1.0 / self.dim)))
+            grid = np.meshgrid(
+                *[np.linspace(0.1, 0.9, n_side) for _ in range(self.dim)]
+            )
+            base_pos = (
+                np.stack([g.flatten() for g in grid], axis=1)[: self.num_particles]
+                * self.world_size
+            )
+            base_pos += np.random.normal(0, self.world_size * 0.01, base_pos.shape)
 
-        # Orbiting particles
-        for i in range(num_central, self.num_particles):
-            # Random orbital radius (weighted toward middle distances)
-            r = np.random.uniform(0.1, 0.45) * self.world_size
+        # Displace positions using noise
+        for d in range(self.dim):
+            # Use different slice of noise for each dimension
+            noise_coords = base_pos / self.world_size * base_freq + offset[d] * 100
+            displacement = perlin_octaves(noise_coords) * noise_strength
+            base_pos[:, d] += displacement
+
+        # Clamp to world bounds
+        base_pos = np.clip(base_pos, 0.05 * self.world_size, 0.95 * self.world_size)
+
+        pos[:, : self.dim] = base_pos
+        pos[:, 3] = self.cfg["particle_mass"]
+
+        # Initialize velocities - either zero, random, or curl noise
+        # vel_mode = np.random.choice(["zero", "random", "curl"])
+        vel_mode = "zero"
+
+        if vel_mode == "zero":
+            vel[:, : self.dim] = 0.0
+        elif vel_mode == "random":
+            speed = np.random.uniform(0.01, 0.1) * self.world_size
+            vel[:, : self.dim] = np.random.normal(
+                0, speed, (self.num_particles, self.dim)
+            )
+        elif vel_mode == "curl":
+            # Curl noise - creates swirling patterns
+            eps = 0.01 * self.world_size
+            coords = pos[:, : self.dim] / self.world_size * base_freq
 
             if self.dim == 2:
-                # 2D: circular orbits in XY plane
-                theta = np.random.uniform(0, 2 * np.pi)
-                pos[i, 0] = center + r * np.cos(theta)
-                pos[i, 1] = center + r * np.sin(theta)
-
-                # Circular orbital velocity: v = sqrt(GM/r)
-                total_central_mass = num_central * central_mass
-                v_orbital = np.sqrt(self.G * total_central_mass / r)
-
-                # Tangential velocity (perpendicular to radius)
-                vel[i, 0] = -v_orbital * np.sin(theta)
-                vel[i, 1] = v_orbital * np.cos(theta)
-
+                # 2D curl: (-dN/dy, dN/dx)
+                n_py = perlin_octaves(coords + [0, eps])
+                n_my = perlin_octaves(coords - [0, eps])
+                n_px = perlin_octaves(coords + [eps, 0])
+                n_mx = perlin_octaves(coords - [eps, 0])
+                vel[:, 0] = -(n_py - n_my) / (2 * eps) * noise_strength * 0.5
+                vel[:, 1] = (n_px - n_mx) / (2 * eps) * noise_strength * 0.5
             elif self.dim == 3:
-                # 3D: disk-like distribution with some thickness
-                theta = np.random.uniform(0, 2 * np.pi)
-                # Slight inclination for thickness
-                phi = np.random.normal(np.pi / 2, 0.1)  # Mostly in XZ plane
+                # 3D curl from 3 noise fields
+                for d in range(3):
+                    d1, d2 = (d + 1) % 3, (d + 2) % 3
+                    offset1 = np.zeros(3)
+                    offset1[d1] = eps
+                    offset2 = np.zeros(3)
+                    offset2[d2] = eps
+                    n1p = perlin_octaves(coords + offset1 + d * 50)
+                    n1m = perlin_octaves(coords - offset1 + d * 50)
+                    n2p = perlin_octaves(coords + offset2 + d * 50)
+                    n2m = perlin_octaves(coords - offset2 + d * 50)
+                    vel[:, d] = (
+                        ((n1p - n1m) - (n2p - n2m)) / (2 * eps) * noise_strength * 0.3
+                    )
 
-                pos[i, 0] = center + r * np.sin(phi) * np.cos(theta)
-                pos[i, 1] = center + r * np.cos(phi)  # Y is "up"
-                pos[i, 2] = center + r * np.sin(phi) * np.sin(theta)
-
-                # Orbital velocity in XZ plane
-                total_central_mass = num_central * central_mass
-                v_orbital = np.sqrt(self.G * total_central_mass / r)
-
-                # Tangent vector in XZ plane (perpendicular to radial)
-                vel[i, 0] = -v_orbital * np.sin(theta)
-                vel[i, 1] = 0.0
-                vel[i, 2] = v_orbital * np.cos(theta)
-
-            # Add small random perturbation for realism
-            vel[i, : self.dim] += np.random.normal(0, v_orbital * 0.05, self.dim)
-            pos[i, 3] = self.cfg["particle_mass"]
-
-        self.pos_buf.write(pos.tobytes())
         self.vel_buf.write(vel.tobytes())
+        self.pos_buf.write(pos.tobytes())
 
     def init_render(self):
         self.render_prog = self.ctx.program(
@@ -248,7 +295,7 @@ class Simulation(mglw.WindowConfig):
                 out vec4 fragColor;
                 void main() { 
                     // Simple orange/white glow
-                    fragColor = vec4(1.0, 0.9, 0.7, 1.0); 
+                    fragColor = vec4(1.0, 1.0, 1.0, 1.0); 
                 }
                 """,
         )
@@ -299,6 +346,14 @@ class Simulation(mglw.WindowConfig):
             z = gs if self.dim == 3 else 1
             return (gs // 8, gs // 8, z)
 
+        # # 0. Center particles on COM
+        # pos_data = np.frombuffer(self.pos_buf.read(), dtype="f4").reshape(-1, 4).copy()
+        # com = np.average(pos_data[:, : self.dim], axis=0, weights=pos_data[:, 3])
+        # shift = self.world_size / 2.0 - com
+        # pos_data[:, : self.dim] += shift
+        # pos_data[:, : self.dim] %= self.world_size  # wrap periodic
+        # self.pos_buf.write(pos_data.tobytes())
+
         # 1. Clear & Mass
         self.clear_mass()
         self.pos_buf.bind_to_storage_buffer(0)
@@ -319,6 +374,12 @@ class Simulation(mglw.WindowConfig):
         spectrum_tex = self.run_fft(
             self.complex_tex_a, self.complex_tex_b, forward=True
         )
+
+        # 3.5. Fourier space manipulation (zeroing DC for now)
+        spectrum_tex.bind_to_image(0, read=True, write=True)
+        self.prog_fourier["tensorDimensions"] = dims
+        self.prog_fourier.run(*dispatch_grid())
+        self.ctx.memory_barrier()
 
         # 4. Greens & Derivatives
         spectrum_tex.bind_to_image(0, read=True, write=False)
