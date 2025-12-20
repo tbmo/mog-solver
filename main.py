@@ -104,6 +104,9 @@ class Simulation(mglw.WindowConfig):
         equiv_cells = effective_res**self.dim
 
         print(f"Linear-Sparse-Grid Config ({self.dim}D):")
+        print(f"  world_size: {self.world_size}")
+        # particle count
+        print(f"  num_particles: {self.num_particles:,}")
         print(f"  n_grids: {self.n_grids}")
         print(f"  grid_size: {self.grid_size}^{self.dim}")
         print(f"  Total cells: {total_cells:,}")
