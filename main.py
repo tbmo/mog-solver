@@ -113,6 +113,111 @@ class Simulation(mglw.WindowConfig):
         )
         print(f"  Memory savings: {equiv_cells / total_cells:.1f}x")
 
+    def get_icosahedral_rotations(self):
+        """
+        Returns all 60 proper rotations of an icosahedron.
+        """
+        rotations = []
+        phi = (1 + np.sqrt(5)) / 2  # golden ratio
+
+        # The 12 vertices of an icosahedron (normalized)
+        icosa_verts = np.array(
+            [
+                [0, 1, phi],
+                [0, 1, -phi],
+                [0, -1, phi],
+                [0, -1, -phi],
+                [1, phi, 0],
+                [1, -phi, 0],
+                [-1, phi, 0],
+                [-1, -phi, 0],
+                [phi, 0, 1],
+                [-phi, 0, 1],
+                [phi, 0, -1],
+                [-phi, 0, -1],
+            ],
+            dtype="f4",
+        )
+        icosa_verts /= np.linalg.norm(icosa_verts[0])
+
+        def rotation_matrix(axis, angle):
+            """Rodrigues' rotation formula"""
+            axis = axis / np.linalg.norm(axis)
+            K = np.array(
+                [[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]]
+            )
+            return np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K)
+
+        def matrix_key(m):
+            """Hash a rotation matrix for deduplication"""
+            return tuple(np.round(m.flatten() * 1000).astype(int))
+
+        seen = set()
+
+        def add_rotation(mat):
+            key = matrix_key(mat)
+            if key not in seen:
+                seen.add(key)
+                rotations.append(mat.astype("f4"))
+
+        # Identity
+        add_rotation(np.eye(3))
+
+        # 5-fold axes through vertices: 72°, 144°, 216°, 288°
+        for v in icosa_verts:
+            for k in [1, 2, 3, 4]:
+                angle = k * 2 * np.pi / 5
+                add_rotation(rotation_matrix(v, angle))
+
+        # 3-fold axes through face centers: 120°, 240°
+        faces = [
+            (0, 2, 8),
+            (0, 8, 4),
+            (0, 4, 6),
+            (0, 6, 9),
+            (0, 9, 2),
+            (3, 1, 10),
+            (3, 10, 5),
+            (3, 5, 7),
+            (3, 7, 11),
+            (3, 11, 1),
+            (2, 9, 7),
+            (2, 7, 5),
+            (2, 5, 8),
+            (8, 5, 10),
+            (8, 10, 4),
+            (4, 10, 1),
+            (4, 1, 6),
+            (6, 1, 11),
+            (6, 11, 9),
+            (9, 11, 7),
+        ]
+        for f in faces:
+            center = icosa_verts[f[0]] + icosa_verts[f[1]] + icosa_verts[f[2]]
+            center /= np.linalg.norm(center)
+            for k in [1, 2]:
+                angle = k * 2 * np.pi / 3
+                add_rotation(rotation_matrix(center, angle))
+
+        # 2-fold axes through edge midpoints: 180°
+        edges = set()
+        for f in faces:
+            edges.add((min(f[0], f[1]), max(f[0], f[1])))
+            edges.add((min(f[1], f[2]), max(f[1], f[2])))
+            edges.add((min(f[2], f[0]), max(f[2], f[0])))
+
+        for e in edges:
+            mid = icosa_verts[e[0]] + icosa_verts[e[1]]
+            mid /= np.linalg.norm(mid)
+            add_rotation(rotation_matrix(mid, np.pi))
+
+        print(f"Generated {len(rotations)} icosahedral rotations")
+
+        # Should be exactly 60
+        assert len(rotations) == 60, f"Expected 60 rotations, got {len(rotations)}"
+
+        return rotations
+
     def get_octahedral_rotations(self):
         """Returns all 24 proper rotations of a cube as 3x3 matrices."""
         rotations = []
@@ -166,21 +271,83 @@ class Simulation(mglw.WindowConfig):
 
         return rotations
 
+    # def compute_transforms(self):
+    #     """
+    #     Compute offset + rotation for each grid.
+    #     Uses tetrahedral offsets + octahedral rotations for 3D.
+    #     Uses diagonal offsets + dihedral rotations for 2D.
+    #     """
+    #     offsets = np.zeros((self.n_grids, 4), dtype="f4")
+    #     # mat3 packed as 3 vec4s (12 floats) for 3D, mat2 packed as 2 vec2s (4 floats) for 2D
+    #     # Use 12 floats for both for simplicity (2D just uses top-left 2x2)
+    #     rotations = np.zeros((self.n_grids, 12), dtype="f4")
+
+    #     if self.dim == 2:
+    #         dihedral = self.get_dihedral_rotations()  # 8 rotations
+
+    #         # Square diagonal directions
+    #         diag_dirs = np.array(
+    #             [
+    #                 [1, 1],
+    #                 [1, -1],
+    #                 [-1, 1],
+    #                 [-1, -1],
+    #             ],
+    #             dtype="f4",
+    #         ) / np.sqrt(2)
+
+    #         for i in range(self.n_grids):
+    #             frac = i / self.n_grids
+
+    #             # Offset: diagonal direction
+    #             d = diag_dirs[i % 4]
+    #             offsets[i, 0:2] = frac * self.voxel_size * d
+
+    #             # Rotation: cycle through dihedral group
+    #             rot = dihedral[i % 8]
+    #             # Pack mat2 into first 4 floats (column-major for GLSL)
+    #             rotations[i, 0:2] = rot[:, 0]  # first column
+    #             rotations[i, 4:6] = rot[
+    #                 :, 1
+    #             ]  # second column (offset by 4 for vec4 alignment)
+
+    #     else:  # 3D
+    #         octahedral = self.get_octahedral_rotations()  # 24 rotations
+
+    #         # Tetrahedral offset directions (maximally symmetric)
+    #         tetra_dirs = np.array(
+    #             [
+    #                 [1, 1, 1],
+    #                 [1, -1, -1],
+    #                 [-1, 1, -1],
+    #                 [-1, -1, 1],
+    #             ],
+    #             dtype="f4",
+    #         ) / np.sqrt(3)
+
+    #         for i in range(self.n_grids):
+    #             frac = i / self.n_grids
+
+    #             # Offset: tetrahedral direction
+    #             d = tetra_dirs[i % 4]
+    #             offsets[i, 0:3] = frac * self.voxel_size * d
+
+    #             # Rotation: cycle through octahedral group
+    #             rot = octahedral[i % 24]
+    #             # Pack mat3 as 3 vec4s (column-major for GLSL)
+    #             rotations[i, 0:3] = rot[:, 0]  # first column
+    #             rotations[i, 4:7] = rot[:, 1]  # second column
+    #             rotations[i, 8:11] = rot[:, 2]  # third column
+
+    #     return offsets, rotations
+
     def compute_transforms(self):
-        """
-        Compute offset + rotation for each grid.
-        Uses tetrahedral offsets + octahedral rotations for 3D.
-        Uses diagonal offsets + dihedral rotations for 2D.
-        """
         offsets = np.zeros((self.n_grids, 4), dtype="f4")
-        # mat3 packed as 3 vec4s (12 floats) for 3D, mat2 packed as 2 vec2s (4 floats) for 2D
-        # Use 12 floats for both for simplicity (2D just uses top-left 2x2)
         rotations = np.zeros((self.n_grids, 12), dtype="f4")
 
         if self.dim == 2:
-            dihedral = self.get_dihedral_rotations()  # 8 rotations
-
-            # Square diagonal directions
+            # Keep dihedral for 2D
+            dihedral = self.get_dihedral_rotations()
             diag_dirs = np.array(
                 [
                     [1, 1],
@@ -193,46 +360,57 @@ class Simulation(mglw.WindowConfig):
 
             for i in range(self.n_grids):
                 frac = i / self.n_grids
-
-                # Offset: diagonal direction
                 d = diag_dirs[i % 4]
                 offsets[i, 0:2] = frac * self.voxel_size * d
-
-                # Rotation: cycle through dihedral group
                 rot = dihedral[i % 8]
-                # Pack mat2 into first 4 floats (column-major for GLSL)
-                rotations[i, 0:2] = rot[:, 0]  # first column
-                rotations[i, 4:6] = rot[
-                    :, 1
-                ]  # second column (offset by 4 for vec4 alignment)
+                rotations[i, 0:2] = rot[:, 0]
+                rotations[i, 4:6] = rot[:, 1]
 
         else:  # 3D
-            octahedral = self.get_octahedral_rotations()  # 24 rotations
+            icosahedral = self.get_icosahedral_rotations()  # 60 rotations
 
-            # Tetrahedral offset directions (maximally symmetric)
-            tetra_dirs = np.array(
+            # Golden ratio offset directions - 20 vertices of dodecahedron
+            # (dual to icosahedron, same symmetry group)
+            phi = (1 + np.sqrt(5)) / 2
+            dodeca_verts = np.array(
                 [
                     [1, 1, 1],
+                    [1, 1, -1],
+                    [1, -1, 1],
                     [1, -1, -1],
+                    [-1, 1, 1],
                     [-1, 1, -1],
                     [-1, -1, 1],
+                    [-1, -1, -1],
+                    [0, phi, 1 / phi],
+                    [0, phi, -1 / phi],
+                    [0, -phi, 1 / phi],
+                    [0, -phi, -1 / phi],
+                    [1 / phi, 0, phi],
+                    [1 / phi, 0, -phi],
+                    [-1 / phi, 0, phi],
+                    [-1 / phi, 0, -phi],
+                    [phi, 1 / phi, 0],
+                    [phi, -1 / phi, 0],
+                    [-phi, 1 / phi, 0],
+                    [-phi, -1 / phi, 0],
                 ],
                 dtype="f4",
-            ) / np.sqrt(3)
+            )
+            dodeca_verts /= np.linalg.norm(dodeca_verts[0])
 
             for i in range(self.n_grids):
                 frac = i / self.n_grids
 
-                # Offset: tetrahedral direction
-                d = tetra_dirs[i % 4]
+                # Offset: cycle through dodecahedron vertices
+                d = dodeca_verts[i % 20]
                 offsets[i, 0:3] = frac * self.voxel_size * d
 
-                # Rotation: cycle through octahedral group
-                rot = octahedral[i % 24]
-                # Pack mat3 as 3 vec4s (column-major for GLSL)
-                rotations[i, 0:3] = rot[:, 0]  # first column
-                rotations[i, 4:7] = rot[:, 1]  # second column
-                rotations[i, 8:11] = rot[:, 2]  # third column
+                # Rotation: cycle through icosahedral group
+                rot = icosahedral[i % 60]
+                rotations[i, 0:3] = rot[:, 0]
+                rotations[i, 4:7] = rot[:, 1]
+                rotations[i, 8:11] = rot[:, 2]
 
         return offsets, rotations
 
@@ -451,18 +629,20 @@ class Simulation(mglw.WindowConfig):
 
             if self.dim == 2:
                 # Unpack mat2 (column-major): col0 at [0:2], col1 at [4:6]
-                rot = np.array([
-                    [rot_data[0], rot_data[4]],
-                    [rot_data[1], rot_data[5]]
-                ], dtype="f4")
+                rot = np.array(
+                    [[rot_data[0], rot_data[4]], [rot_data[1], rot_data[5]]], dtype="f4"
+                )
 
                 # Define unit cell corners centered at origin
-                corners = np.array([
-                    [0, 0],
-                    [vs, 0],
-                    [vs, vs],
-                    [0, vs],
-                ], dtype="f4")
+                corners = np.array(
+                    [
+                        [0, 0],
+                        [vs, 0],
+                        [vs, vs],
+                        [0, vs],
+                    ],
+                    dtype="f4",
+                )
 
                 # Rotate corners around cell center, then translate
                 cell_center = np.array([vs / 2, vs / 2], dtype="f4")
@@ -470,44 +650,59 @@ class Simulation(mglw.WindowConfig):
                 for c in corners:
                     local = c - cell_center
                     rotated = rot @ local
-                    world = rotated + cell_center + np.array([center + offset[0], center + offset[1]], dtype="f4")
+                    world = (
+                        rotated
+                        + cell_center
+                        + np.array([center + offset[0], center + offset[1]], dtype="f4")
+                    )
                     rotated_corners.append(world)
 
                 # Draw square outline (4 edges)
-                positions.extend([
-                    [rotated_corners[0][0], rotated_corners[0][1], 0],
-                    [rotated_corners[1][0], rotated_corners[1][1], 0],
-                    [rotated_corners[1][0], rotated_corners[1][1], 0],
-                    [rotated_corners[2][0], rotated_corners[2][1], 0],
-                    [rotated_corners[2][0], rotated_corners[2][1], 0],
-                    [rotated_corners[3][0], rotated_corners[3][1], 0],
-                    [rotated_corners[3][0], rotated_corners[3][1], 0],
-                    [rotated_corners[0][0], rotated_corners[0][1], 0],
-                ])
+                positions.extend(
+                    [
+                        [rotated_corners[0][0], rotated_corners[0][1], 0],
+                        [rotated_corners[1][0], rotated_corners[1][1], 0],
+                        [rotated_corners[1][0], rotated_corners[1][1], 0],
+                        [rotated_corners[2][0], rotated_corners[2][1], 0],
+                        [rotated_corners[2][0], rotated_corners[2][1], 0],
+                        [rotated_corners[3][0], rotated_corners[3][1], 0],
+                        [rotated_corners[3][0], rotated_corners[3][1], 0],
+                        [rotated_corners[0][0], rotated_corners[0][1], 0],
+                    ]
+                )
                 colors.extend([color] * 8)
             else:
                 # Unpack mat3 (column-major): col0 at [0:3], col1 at [4:7], col2 at [8:11]
-                rot = np.array([
-                    [rot_data[0], rot_data[4], rot_data[8]],
-                    [rot_data[1], rot_data[5], rot_data[9]],
-                    [rot_data[2], rot_data[6], rot_data[10]]
-                ], dtype="f4")
+                rot = np.array(
+                    [
+                        [rot_data[0], rot_data[4], rot_data[8]],
+                        [rot_data[1], rot_data[5], rot_data[9]],
+                        [rot_data[2], rot_data[6], rot_data[10]],
+                    ],
+                    dtype="f4",
+                )
 
                 # Define unit cube corners centered at origin
-                corners = np.array([
-                    [0, 0, 0],
-                    [vs, 0, 0],
-                    [0, vs, 0],
-                    [vs, vs, 0],
-                    [0, 0, vs],
-                    [vs, 0, vs],
-                    [0, vs, vs],
-                    [vs, vs, vs],
-                ], dtype="f4")
+                corners = np.array(
+                    [
+                        [0, 0, 0],
+                        [vs, 0, 0],
+                        [0, vs, 0],
+                        [vs, vs, 0],
+                        [0, 0, vs],
+                        [vs, 0, vs],
+                        [0, vs, vs],
+                        [vs, vs, vs],
+                    ],
+                    dtype="f4",
+                )
 
                 # Rotate corners around cell center, then translate
                 cell_center = np.array([vs / 2, vs / 2, vs / 2], dtype="f4")
-                world_offset = np.array([center + offset[0], center + offset[1], center + offset[2]], dtype="f4")
+                world_offset = np.array(
+                    [center + offset[0], center + offset[1], center + offset[2]],
+                    dtype="f4",
+                )
                 rotated_corners = []
                 for c in corners:
                     local = c - cell_center
@@ -519,18 +714,26 @@ class Simulation(mglw.WindowConfig):
                 # Corners: 0=(0,0,0), 1=(1,0,0), 2=(0,1,0), 3=(1,1,0),
                 #          4=(0,0,1), 5=(1,0,1), 6=(0,1,1), 7=(1,1,1)
                 edges = [
-                    (0, 1), (0, 2), (0, 4),  # from corner 0
-                    (1, 3), (1, 5),           # from corner 1
-                    (2, 3), (2, 6),           # from corner 2
-                    (3, 7),                   # from corner 3
-                    (4, 5), (4, 6),           # from corner 4
-                    (5, 7), (6, 7),           # from corners 5, 6
+                    (0, 1),
+                    (0, 2),
+                    (0, 4),  # from corner 0
+                    (1, 3),
+                    (1, 5),  # from corner 1
+                    (2, 3),
+                    (2, 6),  # from corner 2
+                    (3, 7),  # from corner 3
+                    (4, 5),
+                    (4, 6),  # from corner 4
+                    (5, 7),
+                    (6, 7),  # from corners 5, 6
                 ]
                 for i, j in edges:
-                    positions.extend([
-                        list(rotated_corners[i]),
-                        list(rotated_corners[j]),
-                    ])
+                    positions.extend(
+                        [
+                            list(rotated_corners[i]),
+                            list(rotated_corners[j]),
+                        ]
+                    )
                 colors.extend([color] * 24)
 
         positions = np.array(positions, dtype="f4")
