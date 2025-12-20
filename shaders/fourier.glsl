@@ -1,35 +1,22 @@
-#version 460
-// Injected: #define DIM 2 or 3
+// Linear-Sparse-Grid Fourier Manipulation Shader
+// Zeros DC mode (k=0) for all grids to prevent divergence
+// #version 460, DIM, N_GRIDS, GRID_SIZE injected by Python
+
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-layout(location = 0) uniform ivec3 tensorDimensions;
+layout(location = 0) uniform ivec3 tensorDimensions;  // (GRID_SIZE, GRID_SIZE, N_GRIDS)
 
-#if DIM == 3
 layout(rg32f, binding = 0) uniform image3D spectrumTex;
-#define IVEC_TYPE ivec3
-#else
-layout(rg32f, binding = 0) uniform image2D spectrumTex;
-#define IVEC_TYPE ivec2
-#endif
 
 void main() {
-  IVEC_TYPE pos = IVEC_TYPE(gl_GlobalInvocationID);
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
 
-#if DIM == 3
-  if (any(greaterThanEqual(pos, tensorDimensions)))
-    return;
-#else
-  if (any(greaterThanEqual(pos, tensorDimensions.xy)))
-    return;
-#endif
+    // Bounds check
+    if (any(greaterThanEqual(pos, tensorDimensions)))
+        return;
 
-#if DIM == 3
-  if (pos == ivec3(0, 0, 0)) {
-    imageStore(spectrumTex, pos, vec4(0.0, 0.0, 0.0, 0.0));
-  }
-#else
-  if (pos == ivec2(0, 0)) {
-    imageStore(spectrumTex, pos, vec4(0.0, 0.0, 0.0, 0.0));
-  }
-#endif
+    // Zero DC mode (x=0, y=0) for each grid (all Z values)
+    if (pos.x == 0 && pos.y == 0) {
+        imageStore(spectrumTex, pos, vec4(0.0, 0.0, 0.0, 0.0));
+    }
 }
