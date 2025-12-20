@@ -218,37 +218,6 @@ class Simulation(mglw.WindowConfig):
 
         return rotations
 
-    def get_octahedral_rotations(self):
-        """Returns all 24 proper rotations of a cube as 3x3 matrices."""
-        rotations = []
-
-        # All permutations of (x,y,z)
-        perms = [(0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)]
-
-        # All sign combinations
-        signs = [
-            (1, 1, 1),
-            (1, 1, -1),
-            (1, -1, 1),
-            (1, -1, -1),
-            (-1, 1, 1),
-            (-1, 1, -1),
-            (-1, -1, 1),
-            (-1, -1, -1),
-        ]
-
-        for perm in perms:
-            for sign in signs:
-                mat = np.zeros((3, 3), dtype="f4")
-                for i in range(3):
-                    mat[i, perm[i]] = sign[i]
-
-                # Only keep proper rotations (det = +1)
-                if np.linalg.det(mat) > 0:
-                    rotations.append(mat)
-
-        return rotations
-
     def get_dihedral_rotations(self):
         """Returns all 8 rotations/reflections of a square as 2x2 matrices (D4 group)."""
         rotations = []
@@ -270,76 +239,6 @@ class Simulation(mglw.WindowConfig):
             rotations.append(rot @ reflect)
 
         return rotations
-
-    # def compute_transforms(self):
-    #     """
-    #     Compute offset + rotation for each grid.
-    #     Uses tetrahedral offsets + octahedral rotations for 3D.
-    #     Uses diagonal offsets + dihedral rotations for 2D.
-    #     """
-    #     offsets = np.zeros((self.n_grids, 4), dtype="f4")
-    #     # mat3 packed as 3 vec4s (12 floats) for 3D, mat2 packed as 2 vec2s (4 floats) for 2D
-    #     # Use 12 floats for both for simplicity (2D just uses top-left 2x2)
-    #     rotations = np.zeros((self.n_grids, 12), dtype="f4")
-
-    #     if self.dim == 2:
-    #         dihedral = self.get_dihedral_rotations()  # 8 rotations
-
-    #         # Square diagonal directions
-    #         diag_dirs = np.array(
-    #             [
-    #                 [1, 1],
-    #                 [1, -1],
-    #                 [-1, 1],
-    #                 [-1, -1],
-    #             ],
-    #             dtype="f4",
-    #         ) / np.sqrt(2)
-
-    #         for i in range(self.n_grids):
-    #             frac = i / self.n_grids
-
-    #             # Offset: diagonal direction
-    #             d = diag_dirs[i % 4]
-    #             offsets[i, 0:2] = frac * self.voxel_size * d
-
-    #             # Rotation: cycle through dihedral group
-    #             rot = dihedral[i % 8]
-    #             # Pack mat2 into first 4 floats (column-major for GLSL)
-    #             rotations[i, 0:2] = rot[:, 0]  # first column
-    #             rotations[i, 4:6] = rot[
-    #                 :, 1
-    #             ]  # second column (offset by 4 for vec4 alignment)
-
-    #     else:  # 3D
-    #         octahedral = self.get_octahedral_rotations()  # 24 rotations
-
-    #         # Tetrahedral offset directions (maximally symmetric)
-    #         tetra_dirs = np.array(
-    #             [
-    #                 [1, 1, 1],
-    #                 [1, -1, -1],
-    #                 [-1, 1, -1],
-    #                 [-1, -1, 1],
-    #             ],
-    #             dtype="f4",
-    #         ) / np.sqrt(3)
-
-    #         for i in range(self.n_grids):
-    #             frac = i / self.n_grids
-
-    #             # Offset: tetrahedral direction
-    #             d = tetra_dirs[i % 4]
-    #             offsets[i, 0:3] = frac * self.voxel_size * d
-
-    #             # Rotation: cycle through octahedral group
-    #             rot = octahedral[i % 24]
-    #             # Pack mat3 as 3 vec4s (column-major for GLSL)
-    #             rotations[i, 0:3] = rot[:, 0]  # first column
-    #             rotations[i, 4:7] = rot[:, 1]  # second column
-    #             rotations[i, 8:11] = rot[:, 2]  # third column
-
-    #     return offsets, rotations
 
     def compute_transforms(self):
         offsets = np.zeros((self.n_grids, 4), dtype="f4")
@@ -527,6 +426,62 @@ class Simulation(mglw.WindowConfig):
             -spread, spread, (self.num_particles, self.dim)
         )
         pos[:, 3] = self.cfg["particle_mass"]
+
+        self.pos_buf.write(pos.tobytes())
+        self.vel_buf.write(vel.tobytes())
+
+    def init_particles2(self):
+        """Initialize two colliding disk galaxies."""
+        pos = np.zeros((self.num_particles, 4), dtype="f4")
+        vel = np.zeros((self.num_particles, 4), dtype="f4")
+
+        center = self.world_size / 2.0
+        n_per_galaxy = self.num_particles // 2
+
+        for i, (offset, v_bulk) in enumerate(
+            [
+                (
+                    np.array([-0.2, 0.0, 0.0]),
+                    np.array([0.3, 0.1, 0.0]),
+                ),  # galaxy 1: left, moving right
+                (
+                    np.array([0.2, 0.0, 0.0]),
+                    np.array([-0.3, -0.1, 0.0]),
+                ),  # galaxy 2: right, moving left
+            ]
+        ):
+            start = i * n_per_galaxy
+            end = start + n_per_galaxy
+
+            # spherical distribution with rotation
+            r = np.random.exponential(scale=0.08, size=n_per_galaxy) * self.world_size
+            theta = np.random.uniform(0, 2 * np.pi, n_per_galaxy)
+            phi = np.arccos(np.random.uniform(-1, 1, n_per_galaxy))
+
+            x = r * np.sin(phi) * np.cos(theta)
+            y = r * np.sin(phi) * np.sin(theta)
+            z = r * np.cos(phi)
+
+            pos[start:end, 0] = center + offset[0] * self.world_size + x
+            pos[start:end, 1] = center + offset[1] * self.world_size + y
+            pos[start:end, 2] = center + offset[2] * self.world_size + z
+            pos[start:end, 3] = self.cfg["particle_mass"]
+
+            # 3D circular velocity around random axis per galaxy
+            spin_axis = (
+                np.array([0.3, 0.7, 0.5]) if i == 0 else np.array([-0.5, 0.2, 0.8])
+            )
+            spin_axis = spin_axis / np.linalg.norm(spin_axis)
+
+            v_circ = 0.3 * np.sqrt(r / self.world_size + 0.01)
+            pos_vec = np.stack([x, y, z], axis=1)
+            v_dir = np.cross(spin_axis, pos_vec)
+            v_dir_norm = np.linalg.norm(v_dir, axis=1, keepdims=True) + 1e-10
+            v_dir = v_dir / v_dir_norm
+
+            vel[start:end, 0] = v_circ * v_dir[:, 0] + v_bulk[0]
+            vel[start:end, 1] = v_circ * v_dir[:, 1] + v_bulk[1]
+            vel[start:end, 2] = v_circ * v_dir[:, 2] + v_bulk[2]
 
         self.pos_buf.write(pos.tobytes())
         self.vel_buf.write(vel.tobytes())
@@ -1014,7 +969,7 @@ class Simulation(mglw.WindowConfig):
         self.render_prog["m_view"].write(m_view.tobytes())
         self.render_prog["m_proj"].write(m_proj.tobytes())
 
-        self.vao.render(moderngl.POINTS)
+        # self.vao.render(moderngl.POINTS)
 
         # Debug grid rendering
         if self.show_grid_debug:
@@ -1032,6 +987,10 @@ class Simulation(mglw.WindowConfig):
             elif key == keys.R:
                 self.init_particles()
                 print("Reset particles")
+
+            elif key == keys.T:
+                self.init_particles2()
+                print("Reset particles (two galaxies)")
 
             elif key == keys.SPACE:
                 self.paused = not self.paused
