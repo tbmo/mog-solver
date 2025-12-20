@@ -99,16 +99,20 @@ class Simulation(mglw.WindowConfig):
         self.cam_dist = 3.0
         self.mouse_pressed = False
         self.show_grid_debug = False
+        self.debug_grid_index = -1  # -1 = all grids, 0-7 = specific grid
+        self.show_grid_internals = False  # Show internal cell divisions
 
         effective_res = int(self.n_grids ** (1.0 / self.dim) * self.grid_size)
-        total_cells = self.n_grids * (self.grid_size ** self.dim)
-        equiv_cells = effective_res ** self.dim
+        total_cells = self.n_grids * (self.grid_size**self.dim)
+        equiv_cells = effective_res**self.dim
 
         print(f"Linear-Sparse-Grid Config ({self.dim}D):")
         print(f"  n_grids: {self.n_grids}")
         print(f"  grid_size: {self.grid_size}^{self.dim}")
         print(f"  Total cells: {total_cells:,}")
-        print(f"  Equivalent single grid: {effective_res}^{self.dim} = {equiv_cells:,} cells")
+        print(
+            f"  Equivalent single grid: {effective_res}^{self.dim} = {equiv_cells:,} cells"
+        )
         print(f"  Memory ratio: {total_cells / equiv_cells:.2f}x")
 
     def compute_offsets(self):
@@ -123,7 +127,12 @@ class Simulation(mglw.WindowConfig):
             if self.dim == 2:
                 offsets[i] = [frac * self.voxel_size, frac * self.voxel_size, 0, 0]
             else:  # 3D
-                offsets[i] = [frac * self.voxel_size, frac * self.voxel_size, frac * self.voxel_size, 0]
+                offsets[i] = [
+                    frac * self.voxel_size,
+                    frac * self.voxel_size,
+                    frac * self.voxel_size,
+                    0,
+                ]
         return offsets
 
     def load_config(self):
@@ -152,7 +161,7 @@ class Simulation(mglw.WindowConfig):
 
         # Mass buffer: one contiguous buffer for all grids
         # Layout: [grid0_cells..., grid1_cells..., ...]
-        cells_per_grid = self.grid_size ** self.dim
+        cells_per_grid = self.grid_size**self.dim
         total_cells = self.n_grids * cells_per_grid
         self.mass_buf = self.ctx.buffer(reserve=total_cells * 4)
 
@@ -186,7 +195,9 @@ class Simulation(mglw.WindowConfig):
             size = (gs, gs, gs)
 
             def create_tex_array(channels):
-                return [self.ctx.texture3d(size, channels, dtype="f4") for _ in range(ng)]
+                return [
+                    self.ctx.texture3d(size, channels, dtype="f4") for _ in range(ng)
+                ]
 
             self.complex_tex_a = create_tex_array(2)
             self.complex_tex_b = create_tex_array(2)
@@ -347,83 +358,146 @@ class Simulation(mglw.WindowConfig):
 
     def init_grid_debug_geometry(self):
         """Create grid line geometry for debug visualization."""
+
         # Generate distinct colors for each grid using golden ratio hue
         def hsv_to_rgb(h, s, v):
             i = int(h * 6)
             f = h * 6 - i
             p, q, t = v * (1 - s), v * (1 - f * s), v * (1 - (1 - f) * s)
             i = i % 6
-            if i == 0: return (v, t, p)
-            if i == 1: return (q, v, p)
-            if i == 2: return (p, v, t)
-            if i == 3: return (p, q, v)
-            if i == 4: return (t, p, v)
+            if i == 0:
+                return (v, t, p)
+            if i == 1:
+                return (q, v, p)
+            if i == 2:
+                return (p, v, t)
+            if i == 3:
+                return (p, q, v)
+            if i == 4:
+                return (t, p, v)
             return (v, p, q)
 
-        positions = []
-        colors = []
         gs = self.grid_size
         vs = self.voxel_size
         ws = self.world_size
+
+        # Store per-grid geometry for selective rendering
+        # Each grid has two VAOs: outline only, and full internals
+        self.grid_debug_vaos = []  # Outline only
+        self.grid_debug_internal_vaos = []  # Full internal grid lines
+        self.grid_debug_bufs = []
 
         for grid_idx in range(self.n_grids):
             # Golden ratio color generation for distinct colors
             hue = (grid_idx * 0.618033988749895) % 1.0
             r, g, b = hsv_to_rgb(hue, 0.8, 0.9)
             color = (r, g, b)
-            offset = self.offsets[grid_idx][:self.dim]
+            offset = self.offsets[grid_idx][: self.dim]
+
+            # Outline geometry
+            outline_positions = []
+            outline_colors = []
+
+            # Internal geometry (includes outline + all cell divisions)
+            internal_positions = []
+            internal_colors = []
 
             if self.dim == 2:
-                # Horizontal lines
+                # For 2D, outline and internal are the same (grid lines)
                 for i in range(gs + 1):
                     y = (i * vs + offset[1]) % ws
-                    positions.extend([[0, y, 0], [ws, y, 0]])
-                    colors.extend([color, color])
-                # Vertical lines
+                    internal_positions.extend([[0, y, 0], [ws, y, 0]])
+                    internal_colors.extend([color, color])
                 for i in range(gs + 1):
                     x = (i * vs + offset[0]) % ws
-                    positions.extend([[x, 0, 0], [x, ws, 0]])
-                    colors.extend([color, color])
+                    internal_positions.extend([[x, 0, 0], [x, ws, 0]])
+                    internal_colors.extend([color, color])
+                outline_positions = internal_positions
+                outline_colors = internal_colors
             else:  # 3D
-                # X-direction lines (along X axis)
+                ox, oy, oz = offset[0], offset[1], offset[2]
+
+                # Outline: just the 12 edges of the cube
+                outline_positions.extend([[ox, oy, oz], [ox + ws, oy, oz]])
+                outline_positions.extend([[ox, oy, oz], [ox, oy + ws, oz]])
+                outline_positions.extend([[ox + ws, oy, oz], [ox + ws, oy + ws, oz]])
+                outline_positions.extend([[ox, oy + ws, oz], [ox + ws, oy + ws, oz]])
+                outline_positions.extend([[ox, oy, oz + ws], [ox + ws, oy, oz + ws]])
+                outline_positions.extend([[ox, oy, oz + ws], [ox, oy + ws, oz + ws]])
+                outline_positions.extend(
+                    [[ox + ws, oy, oz + ws], [ox + ws, oy + ws, oz + ws]]
+                )
+                outline_positions.extend(
+                    [[ox, oy + ws, oz + ws], [ox + ws, oy + ws, oz + ws]]
+                )
+                outline_positions.extend([[ox, oy, oz], [ox, oy, oz + ws]])
+                outline_positions.extend([[ox + ws, oy, oz], [ox + ws, oy, oz + ws]])
+                outline_positions.extend([[ox, oy + ws, oz], [ox, oy + ws, oz + ws]])
+                outline_positions.extend(
+                    [[ox + ws, oy + ws, oz], [ox + ws, oy + ws, oz + ws]]
+                )
+                outline_colors.extend([color] * 24)
+
+                # Internal: all cell division lines
                 for iy in range(gs + 1):
                     for iz in range(gs + 1):
                         y = (iy * vs + offset[1]) % ws
                         z = (iz * vs + offset[2]) % ws
-                        positions.extend([[0, y, z], [ws, y, z]])
-                        colors.extend([color, color])
-                # Y-direction lines
+                        internal_positions.extend([[0, y, z], [ws, y, z]])
+                        internal_colors.extend([color, color])
                 for ix in range(gs + 1):
                     for iz in range(gs + 1):
                         x = (ix * vs + offset[0]) % ws
                         z = (iz * vs + offset[2]) % ws
-                        positions.extend([[x, 0, z], [x, ws, z]])
-                        colors.extend([color, color])
-                # Z-direction lines
+                        internal_positions.extend([[x, 0, z], [x, ws, z]])
+                        internal_colors.extend([color, color])
                 for ix in range(gs + 1):
                     for iy in range(gs + 1):
                         x = (ix * vs + offset[0]) % ws
                         y = (iy * vs + offset[1]) % ws
-                        positions.extend([[x, y, 0], [x, y, ws]])
-                        colors.extend([color, color])
+                        internal_positions.extend([[x, y, 0], [x, y, ws]])
+                        internal_colors.extend([color, color])
 
-        positions = np.array(positions, dtype="f4")
-        colors = np.array(colors, dtype="f4")
+            # Create outline VAO
+            outline_positions = np.array(outline_positions, dtype="f4")
+            outline_colors = np.array(outline_colors, dtype="f4")
+            outline_pos_buf = self.ctx.buffer(outline_positions.tobytes())
+            outline_color_buf = self.ctx.buffer(outline_colors.tobytes())
+            outline_vao = self.ctx.vertex_array(
+                self.grid_debug_prog,
+                [
+                    (outline_pos_buf, "3f", "in_pos"),
+                    (outline_color_buf, "3f", "in_color"),
+                ],
+            )
+            self.grid_debug_vaos.append(outline_vao)
 
-        self.grid_debug_pos_buf = self.ctx.buffer(positions.tobytes())
-        self.grid_debug_color_buf = self.ctx.buffer(colors.tobytes())
-        self.grid_debug_vao = self.ctx.vertex_array(
-            self.grid_debug_prog,
-            [
-                (self.grid_debug_pos_buf, "3f", "in_pos"),
-                (self.grid_debug_color_buf, "3f", "in_color"),
-            ],
-        )
-        self.grid_debug_vertex_count = len(positions)
+            # Create internal VAO
+            internal_positions = np.array(internal_positions, dtype="f4")
+            internal_colors = np.array(internal_colors, dtype="f4")
+            internal_pos_buf = self.ctx.buffer(internal_positions.tobytes())
+            internal_color_buf = self.ctx.buffer(internal_colors.tobytes())
+            internal_vao = self.ctx.vertex_array(
+                self.grid_debug_prog,
+                [
+                    (internal_pos_buf, "3f", "in_pos"),
+                    (internal_color_buf, "3f", "in_color"),
+                ],
+            )
+            self.grid_debug_internal_vaos.append(internal_vao)
+
+            self.grid_debug_bufs.append(
+                (
+                    outline_pos_buf,
+                    outline_color_buf,
+                    internal_pos_buf,
+                    internal_color_buf,
+                )
+            )
 
     def clear_mass(self):
         """Clear all grid mass buffers."""
-        cells_per_grid = self.grid_size ** self.dim
+        cells_per_grid = self.grid_size**self.dim
         total_cells = self.n_grids * cells_per_grid
         zeros = np.zeros(total_cells, dtype="u4")
         self.mass_buf.write(zeros.tobytes())
@@ -511,7 +585,9 @@ class Simulation(mglw.WindowConfig):
         self.ctx.memory_barrier()
 
         # Step B.2: Forward FFT
-        spectrum_tex = self.run_fft_2d(self.complex_tex_a, self.complex_tex_b, forward=True)
+        spectrum_tex = self.run_fft_2d(
+            self.complex_tex_a, self.complex_tex_b, forward=True
+        )
 
         # Step B.3: Zero DC
         spectrum_tex.bind_to_image(0, read=True, write=True)
@@ -594,7 +670,7 @@ class Simulation(mglw.WindowConfig):
                 self.complex_tex_a[grid_idx],
                 self.complex_tex_b[grid_idx],
                 self.complex_tex_c[grid_idx],
-                forward=True
+                forward=True,
             )
 
             # Step B.3: Zero DC
@@ -620,19 +696,19 @@ class Simulation(mglw.WindowConfig):
                 self.grad_comp_x[grid_idx],
                 self.complex_tex_b[grid_idx],
                 self.complex_tex_c[grid_idx],
-                forward=False
+                forward=False,
             )
             real_y = self.run_fft_3d_single(
                 self.grad_comp_y[grid_idx],
                 self.complex_tex_a[grid_idx],
                 self.complex_tex_c[grid_idx],
-                forward=False
+                forward=False,
             )
             real_z = self.run_fft_3d_single(
                 self.grad_comp_z[grid_idx],
                 self.complex_tex_c[grid_idx],
                 self.complex_tex_b[grid_idx],
-                forward=False
+                forward=False,
             )
 
             # Step B.6: Pack
@@ -696,7 +772,18 @@ class Simulation(mglw.WindowConfig):
         if self.show_grid_debug:
             self.grid_debug_prog["m_view"].write(m_view.tobytes())
             self.grid_debug_prog["m_proj"].write(m_proj.tobytes())
-            self.grid_debug_vao.render(moderngl.LINES)
+            vaos = (
+                self.grid_debug_internal_vaos
+                if self.show_grid_internals
+                else self.grid_debug_vaos
+            )
+            if self.debug_grid_index < 0:
+                # Render all grids
+                for vao in vaos:
+                    vao.render(moderngl.LINES)
+            else:
+                # Render single grid
+                vaos[self.debug_grid_index].render(moderngl.LINES)
 
     def key_event(self, key, action, modifiers):
         keys = self.wnd.keys
@@ -728,6 +815,29 @@ class Simulation(mglw.WindowConfig):
             elif key == keys.NUMBER_1:
                 self.show_grid_debug = not self.show_grid_debug
                 print(f"Grid debug: {'ON' if self.show_grid_debug else 'OFF'}")
+
+            elif key == keys.NUMBER_0:
+                self.debug_grid_index = -1
+                print("Showing all grids")
+
+            elif key in [
+                keys.NUMBER_2,
+                keys.NUMBER_3,
+                keys.NUMBER_4,
+                keys.NUMBER_5,
+                keys.NUMBER_6,
+                keys.NUMBER_7,
+                keys.NUMBER_8,
+                keys.NUMBER_9,
+            ]:
+                idx = key - keys.NUMBER_2  # 0-7
+                if idx < self.n_grids:
+                    self.debug_grid_index = idx
+                    print(f"Showing grid {idx}")
+
+            elif key == 96:  # ` key
+                self.show_grid_internals = not self.show_grid_internals
+                print(f"Grid internals: {'ON' if self.show_grid_internals else 'OFF'}")
 
 
 if __name__ == "__main__":
