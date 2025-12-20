@@ -99,7 +99,7 @@ class Simulation(mglw.WindowConfig):
         self.debug_grid_index = -1  # -1 = all grids, 0-7 = specific grid
         self.show_grid_internals = False  # Show internal cell divisions
 
-        effective_res = int(self.n_grids ** (1.0 / self.dim) * self.grid_size)
+        effective_res = self.grid_size * self.n_grids
         total_cells = self.n_grids * (self.grid_size**self.dim)
         equiv_cells = effective_res**self.dim
 
@@ -110,7 +110,7 @@ class Simulation(mglw.WindowConfig):
         print(
             f"  Equivalent single grid: {effective_res}^{self.dim} = {equiv_cells:,} cells"
         )
-        print(f"  Memory ratio: {total_cells / equiv_cells:.2f}x")
+        print(f"  Memory savings: {equiv_cells / total_cells:.1f}x")
 
     def compute_offsets(self):
         """
