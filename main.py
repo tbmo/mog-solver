@@ -99,9 +99,13 @@ class Simulation(mglw.WindowConfig):
         Compute diagonal offsets for each grid.
         Offsets are in world-space units (fraction of voxel_size).
         offset[i] = (i/n_grids, i/n_grids) * voxel_size
+
+        The offsets uniformly sample within one cell, starting from 0.
+        Since the grid is periodic, this creates uniform sub-cell sampling.
         """
         offsets = np.zeros((self.n_grids, 2), dtype="f4")
         for i in range(self.n_grids):
+            # Offset from 0 to (n_grids-1)/n_grids of a voxel
             frac = i / self.n_grids
             offsets[i] = [frac * self.voxel_size, frac * self.voxel_size]
         return offsets

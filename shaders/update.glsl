@@ -76,10 +76,8 @@ void main() {
         // Calculate sample position with offset: sample_pos = pos - offset[gridIdx]
         vec2 samplePos = pos - offsets[gridIdx];
 
-        // Periodic wrapping
-        samplePos = mod(samplePos, worldSize);
-        if (samplePos.x < 0.0) samplePos.x += worldSize;
-        if (samplePos.y < 0.0) samplePos.y += worldSize;
+        // Periodic wrapping (handle negative values properly)
+        samplePos = mod(mod(samplePos, worldSize) + worldSize, worldSize);
 
         // Sample with bilinear interpolation
         vec2 gridForce = sampleForce(samplePos, gridIdx);
