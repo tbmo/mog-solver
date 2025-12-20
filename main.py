@@ -63,9 +63,6 @@ class Simulation(mglw.WindowConfig):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.wnd.key_event_func = self.key_event
-        self.wnd.mouse_drag_event_func = self.mouse_drag_event
-        self.wnd.mouse_scroll_event_func = self.mouse_scroll_event
         self.cfg = self.load_config()
 
         self.dim = self.cfg.get("dimensions", 2)
@@ -209,12 +206,12 @@ class Simulation(mglw.WindowConfig):
 
             self.gradient_tex = create_tex_array(4)
 
-    def mouse_drag_event(self, x, y, dx, dy):
+    def on_mouse_drag_event(self, x, y, dx, dy):
         if self.wnd.mouse_states.left:
             self.cam_rot_x -= dx * 0.5
             self.cam_rot_y += dy * 0.5
 
-    def mouse_scroll_event(self, x_offset, y_offset):
+    def on_mouse_scroll_event(self, x_offset, y_offset):
         self.cam_dist -= y_offset * 0.2
         self.cam_dist = max(0.1, self.cam_dist)
 
@@ -785,7 +782,7 @@ class Simulation(mglw.WindowConfig):
                 # Render single grid
                 vaos[self.debug_grid_index].render(moderngl.LINES)
 
-    def key_event(self, key, action, modifiers):
+    def on_key_event(self, key, action, modifiers):
         keys = self.wnd.keys
 
         if action == keys.ACTION_PRESS:
@@ -835,7 +832,7 @@ class Simulation(mglw.WindowConfig):
                     self.debug_grid_index = idx
                     print(f"Showing grid {idx}")
 
-            elif key == 96:  # ` key
+            elif key == 96:  # ` key (glfw.KEY_GRAVE_ACCENT)
                 self.show_grid_internals = not self.show_grid_internals
                 print(f"Grid internals: {'ON' if self.show_grid_internals else 'OFF'}")
 
