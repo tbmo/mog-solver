@@ -51,6 +51,6 @@ void main() {
   int idx = voxelPos.y * tensorDimensions.x + voxelPos.x;
 #endif
 
-  uint massInt = uint(particle.w * 1000.0);
+  uint massInt = uint(particle.w * 1.0);
   atomicAdd(mass_grid[idx], massInt);
 }

@@ -5,7 +5,7 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(location = 0) uniform ivec3 tensorDimensions;
 layout(location = 1) uniform float G;
 layout(location = 2) uniform float worldSize;
-layout(location = 3) uniform float epsilon = 1e-6;
+layout(location = 3) uniform float epsilon = 1e-9;
 
 #if DIM == 3
 layout(rg32f, binding = 0) readonly uniform image3D inputTexture;
