@@ -66,32 +66,8 @@ mat3 getRotation(int gridIdx) {
   return mat3(col0.xyz, col1.xyz, col2.xyz);
 }
 
-layout(rgba32f, binding = 0) readonly uniform image3D gradientTexture0;
-layout(rgba32f, binding = 1) readonly uniform image3D gradientTexture1;
-layout(rgba32f, binding = 2) readonly uniform image3D gradientTexture2;
-layout(rgba32f, binding = 3) readonly uniform image3D gradientTexture3;
-layout(rgba32f, binding = 4) readonly uniform image3D gradientTexture4;
-layout(rgba32f, binding = 5) readonly uniform image3D gradientTexture5;
-layout(rgba32f, binding = 6) readonly uniform image3D gradientTexture6;
-layout(rgba32f, binding = 7) readonly uniform image3D gradientTexture7;
-
-vec3 sampleFromTexture(int texIdx, ivec3 p) {
-  if (texIdx == 0)
-    return imageLoad(gradientTexture0, p).xyz;
-  if (texIdx == 1)
-    return imageLoad(gradientTexture1, p).xyz;
-  if (texIdx == 2)
-    return imageLoad(gradientTexture2, p).xyz;
-  if (texIdx == 3)
-    return imageLoad(gradientTexture3, p).xyz;
-  if (texIdx == 4)
-    return imageLoad(gradientTexture4, p).xyz;
-  if (texIdx == 5)
-    return imageLoad(gradientTexture5, p).xyz;
-  if (texIdx == 6)
-    return imageLoad(gradientTexture6, p).xyz;
-  return imageLoad(gradientTexture7, p).xyz;
-}
+// 3D: Single packed texture (X, Y, Z*nGrids)
+layout(rgba32f, binding = 0) readonly uniform image3D gradientTexture;
 
 vec3 sampleForce3D(vec3 worldPos, int gridIdx) {
   vec3 voxelCoord = worldPos / voxelSize;
@@ -117,14 +93,19 @@ vec3 sampleForce3D(vec3 worldPos, int gridIdx) {
   if (z1 < 0)
     z1 += gridSize;
 
-  vec3 f000 = sampleFromTexture(gridIdx, ivec3(x0, y0, z0));
-  vec3 f100 = sampleFromTexture(gridIdx, ivec3(x1, y0, z0));
-  vec3 f010 = sampleFromTexture(gridIdx, ivec3(x0, y1, z0));
-  vec3 f110 = sampleFromTexture(gridIdx, ivec3(x1, y1, z0));
-  vec3 f001 = sampleFromTexture(gridIdx, ivec3(x0, y0, z1));
-  vec3 f101 = sampleFromTexture(gridIdx, ivec3(x1, y0, z1));
-  vec3 f011 = sampleFromTexture(gridIdx, ivec3(x0, y1, z1));
-  vec3 f111 = sampleFromTexture(gridIdx, ivec3(x1, y1, z1));
+  // Convert local z to global z in packed texture
+  int zBase = gridIdx * gridSize;
+  int gz0 = zBase + z0;
+  int gz1 = zBase + z1;
+
+  vec3 f000 = imageLoad(gradientTexture, ivec3(x0, y0, gz0)).xyz;
+  vec3 f100 = imageLoad(gradientTexture, ivec3(x1, y0, gz0)).xyz;
+  vec3 f010 = imageLoad(gradientTexture, ivec3(x0, y1, gz0)).xyz;
+  vec3 f110 = imageLoad(gradientTexture, ivec3(x1, y1, gz0)).xyz;
+  vec3 f001 = imageLoad(gradientTexture, ivec3(x0, y0, gz1)).xyz;
+  vec3 f101 = imageLoad(gradientTexture, ivec3(x1, y0, gz1)).xyz;
+  vec3 f011 = imageLoad(gradientTexture, ivec3(x0, y1, gz1)).xyz;
+  vec3 f111 = imageLoad(gradientTexture, ivec3(x1, y1, gz1)).xyz;
 
   vec3 f00 = mix(f000, f100, frac.x);
   vec3 f10 = mix(f010, f110, frac.x);

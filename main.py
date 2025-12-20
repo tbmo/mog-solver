@@ -471,23 +471,22 @@ class Simulation(mglw.WindowConfig):
             self.gradient_tex = create_tex(4)
 
         else:
-            # 3D: Create separate textures for EACH grid to avoid spectral leakage
-            size = (gs, gs, gs)
+            # 3D: Pack all grids into single texture with W dimension in Z
+            # Shape: (X, Y, Z * n_grids) where each grid occupies [z*gs : (z+1)*gs]
+            # FFT operates within each grid's Z slice, avoiding spectral leakage
+            size = (gs, gs, gs * ng)
 
-            def create_tex_array(channels):
-                return [
-                    self.ctx.texture3d(size, channels, dtype="f4") for _ in range(ng)
-                ]
+            def create_tex(channels):
+                return self.ctx.texture3d(size, channels, dtype="f4")
 
-            self.complex_tex_a = create_tex_array(2)
-            self.complex_tex_b = create_tex_array(2)
-            self.complex_tex_c = create_tex_array(2)
+            self.complex_tex_a = create_tex(2)
+            self.complex_tex_b = create_tex(2)
 
-            self.grad_comp_x = create_tex_array(2)
-            self.grad_comp_y = create_tex_array(2)
-            self.grad_comp_z = create_tex_array(2)
+            self.grad_comp_x = create_tex(2)
+            self.grad_comp_y = create_tex(2)
+            self.grad_comp_z = create_tex(2)
 
-            self.gradient_tex = create_tex_array(4)
+            self.gradient_tex = create_tex(4)
 
     def on_mouse_drag_event(self, x, y, dx, dy):
         if self.wnd.mouse_states.left:
@@ -510,6 +509,7 @@ class Simulation(mglw.WindowConfig):
         self.prog_mass = self.ctx.compute_shader(load("mass.glsl"))
         self.prog_complex = self.ctx.compute_shader(load("complex.glsl"))
         self.prog_fft = self.ctx.compute_shader(load("fft.glsl"))
+        self.prog_fft_batched = self.ctx.compute_shader(load("fft_batched.glsl"))
         self.prog_greens = self.ctx.compute_shader(load("greens.glsl"))
         self.prog_fourier = self.ctx.compute_shader(load("fourier.glsl"))
         self.prog_pack = self.ctx.compute_shader(load("pack.glsl"))
@@ -781,27 +781,34 @@ class Simulation(mglw.WindowConfig):
 
         return curr_src
 
-    def run_fft_3d_single(self, src_tex, dst_tex, scratch_tex, forward=True):
-        """Run 3D FFT on a single grid texture."""
+    def run_fft_3d_batched(self, src_tex, dst_tex, forward=True):
+        """Run batched 3D FFT on packed texture (X, Y, Z*n_grids).
+
+        Each grid occupies Z slices [i*gs : (i+1)*gs]. FFT operates within
+        each grid's slice independently, avoiding spectral leakage between grids.
+        """
         gs = self.grid_size
+        ng = self.n_grids
         num_stages = int(np.log2(gs))
         direction = 1 if forward else -1
 
         curr_src = src_tex
         curr_dst = dst_tex
 
-        for axis in [0, 1, 2]:  # X, Y, Z
-            self.prog_fft["direction"] = direction
-            self.prog_fft["axis"] = axis
-            self.prog_fft["gridSize"] = gs
+        for axis in [0, 1, 2]:  # X, Y, Z (within each grid)
+            self.prog_fft_batched["direction"] = direction
+            self.prog_fft_batched["axis"] = axis
+            self.prog_fft_batched["gridSize"] = gs
+            self.prog_fft_batched["nGrids"] = ng
 
             for stage in range(num_stages + 1):
-                self.prog_fft["stage"] = stage
+                self.prog_fft_batched["stage"] = stage
 
                 curr_src.bind_to_image(0, read=True, write=False)
                 curr_dst.bind_to_image(1, read=False, write=True)
 
-                self.prog_fft.run(max(1, gs // 8), max(1, gs // 8), gs)
+                # Dispatch: gs×gs threads, ng groups in Z
+                self.prog_fft_batched.run(max(1, gs // 8), max(1, gs // 8), ng)
                 self.ctx.memory_barrier()
 
                 curr_src, curr_dst = curr_dst, curr_src
@@ -886,11 +893,16 @@ class Simulation(mglw.WindowConfig):
         self.ctx.memory_barrier()
 
     def step_3d(self):
-        """Simulation step for 3D - processes grids independently."""
+        """Simulation step for 3D - batched processing of all grids.
+
+        Uses packed texture layout (X, Y, Z*n_grids) to process all grids
+        in parallel, avoiding the O(n_grids) loop overhead.
+        """
         gs = self.grid_size
         ng = self.n_grids
         n_particles = self.num_particles
-        dispatch_single = (max(1, gs // 8), max(1, gs // 8), gs)
+        # Dispatch covers all grids: (gs, gs, gs*ng) total threads
+        dispatch = (max(1, gs // 8), max(1, gs // 8), gs * ng)
 
         # Step A: Scatter (all grids at once)
         self.clear_mass()
@@ -905,81 +917,65 @@ class Simulation(mglw.WindowConfig):
         self.prog_mass.run((n_particles + 255) // 256)
         self.ctx.memory_barrier()
 
-        # Process each grid independently for FFT to avoid spectral leakage
+        # Step B.1: Mass -> Complex (all grids batched)
+        self.mass_buf.bind_to_storage_buffer(0)
+        self.complex_tex_a.bind_to_image(1, read=False, write=True)
+        set_uniform(self.prog_complex, "gridSize", gs)
+        set_uniform(self.prog_complex, "nGrids", ng)
+        self.prog_complex.run(*dispatch)
+        self.ctx.memory_barrier()
 
-        for grid_idx in range(ng):
-            # Step B.1: Mass -> Complex for this grid
-            self.mass_buf.bind_to_storage_buffer(0)
-            self.complex_tex_a[grid_idx].bind_to_image(1, read=False, write=True)
-            set_uniform(self.prog_complex, "gridSize", gs)
-            set_uniform(self.prog_complex, "nGrids", ng)
-            set_uniform(self.prog_complex, "currentGrid", grid_idx)
-            self.prog_complex.run(*dispatch_single)
-            self.ctx.memory_barrier()
+        # Step B.2: Forward FFT (batched - processes all grids in parallel)
+        spectrum_tex = self.run_fft_3d_batched(
+            self.complex_tex_a, self.complex_tex_b, forward=True
+        )
 
-            # Step B.2: Forward FFT
-            spectrum_tex = self.run_fft_3d_single(
-                self.complex_tex_a[grid_idx],
-                self.complex_tex_b[grid_idx],
-                self.complex_tex_c[grid_idx],
-                forward=True,
-            )
+        # Step B.3: Zero DC (all grids)
+        spectrum_tex.bind_to_image(0, read=True, write=True)
+        set_uniform(self.prog_fourier, "gridSize", gs)
+        set_uniform(self.prog_fourier, "nGrids", ng)
+        self.prog_fourier.run(*dispatch)
+        self.ctx.memory_barrier()
 
-            # Step B.3: Zero DC
-            spectrum_tex.bind_to_image(0, read=True, write=True)
-            set_uniform(self.prog_fourier, "gridSize", gs)
-            set_uniform(self.prog_fourier, "nGrids", ng)
-            self.prog_fourier.run(*dispatch_single)
-            self.ctx.memory_barrier()
+        # Step B.4: Green's function (all grids)
+        spectrum_tex.bind_to_image(0, read=True, write=False)
+        self.grad_comp_x.bind_to_image(1, read=False, write=True)
+        self.grad_comp_y.bind_to_image(2, read=False, write=True)
+        self.grad_comp_z.bind_to_image(3, read=False, write=True)
+        set_uniform(self.prog_greens, "gridSize", gs)
+        set_uniform(self.prog_greens, "nGrids", ng)
+        set_uniform(self.prog_greens, "G", self.G)
+        set_uniform(self.prog_greens, "worldSize", self.world_size)
+        self.prog_greens.run(*dispatch)
+        self.ctx.memory_barrier()
 
-            # Step B.4: Green's function
-            spectrum_tex.bind_to_image(0, read=True, write=False)
-            self.grad_comp_x[grid_idx].bind_to_image(1, read=False, write=True)
-            self.grad_comp_y[grid_idx].bind_to_image(2, read=False, write=True)
-            self.grad_comp_z[grid_idx].bind_to_image(3, read=False, write=True)
-            set_uniform(self.prog_greens, "gridSize", gs)
-            set_uniform(self.prog_greens, "G", self.G)
-            set_uniform(self.prog_greens, "worldSize", self.world_size)
-            self.prog_greens.run(*dispatch_single)
-            self.ctx.memory_barrier()
+        # Step B.5: Inverse FFT (batched for each component)
+        real_x = self.run_fft_3d_batched(
+            self.grad_comp_x, self.complex_tex_b, forward=False
+        )
+        real_y = self.run_fft_3d_batched(
+            self.grad_comp_y, self.complex_tex_a, forward=False
+        )
+        real_z = self.run_fft_3d_batched(
+            self.grad_comp_z, self.complex_tex_b, forward=False
+        )
 
-            # Step B.5: Inverse FFT
-            real_x = self.run_fft_3d_single(
-                self.grad_comp_x[grid_idx],
-                self.complex_tex_b[grid_idx],
-                self.complex_tex_c[grid_idx],
-                forward=False,
-            )
-            real_y = self.run_fft_3d_single(
-                self.grad_comp_y[grid_idx],
-                self.complex_tex_a[grid_idx],
-                self.complex_tex_c[grid_idx],
-                forward=False,
-            )
-            real_z = self.run_fft_3d_single(
-                self.grad_comp_z[grid_idx],
-                self.complex_tex_c[grid_idx],
-                self.complex_tex_b[grid_idx],
-                forward=False,
-            )
-
-            # Step B.6: Pack
-            real_x.bind_to_image(0, read=True, write=False)
-            real_y.bind_to_image(1, read=True, write=False)
-            real_z.bind_to_image(2, read=True, write=False)
-            self.gradient_tex[grid_idx].bind_to_image(3, read=False, write=True)
-            set_uniform(self.prog_pack, "gridSize", gs)
-            set_uniform(self.prog_pack, "nGrids", ng)
-            self.prog_pack.run(*dispatch_single)
-            self.ctx.memory_barrier()
+        # Step B.6: Pack (all grids)
+        real_x.bind_to_image(0, read=True, write=False)
+        real_y.bind_to_image(1, read=True, write=False)
+        real_z.bind_to_image(2, read=True, write=False)
+        self.gradient_tex.bind_to_image(3, read=False, write=True)
+        set_uniform(self.prog_pack, "gridSize", gs)
+        set_uniform(self.prog_pack, "nGrids", ng)
+        self.prog_pack.run(*dispatch)
+        self.ctx.memory_barrier()
 
         # Step C & D: Gather from all grids + Integrate
         self.pos_buf.bind_to_storage_buffer(0)
         self.vel_buf.bind_to_storage_buffer(1)
         self.offset_buf.bind_to_storage_buffer(2)
-        # Bind all gradient textures for gather
-        for grid_idx in range(ng):
-            self.gradient_tex[grid_idx].bind_to_image(grid_idx, read=True, write=False)
+        self.rotation_buf.bind_to_storage_buffer(3)
+        self.gradient_tex.bind_to_image(0, read=True, write=False)
         set_uniform(self.prog_update, "deltaTime", self.dt * self.timescale)
         set_uniform(self.prog_update, "gridSize", gs)
         set_uniform(self.prog_update, "nGrids", ng)
