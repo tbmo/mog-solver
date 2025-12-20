@@ -1,7 +1,7 @@
 // Linear-Sparse-Grid Green's Function Shader
 // Applies Green's function and spectral differentiation in Fourier space
 // For 2D: Z is batch dimension
-// For 3D: Single grid at a time
+// For 3D: Packed layout (X, Y, Z*nGrids) - each grid's local Z for wave numbers
 // #version 460, DIM, N_GRIDS, GRID_SIZE injected by Python
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
@@ -44,7 +44,10 @@ void main() {
   float k2 = kx * kx + ky * ky;
   float geoFactor = -2.0 * PI;
 #else
-  float kz = getWaveNumber(pos.z, gridSize, worldSize);
+  // 3D: pos.z encodes gridIdx * gridSize + localZ
+  // We need localZ for the wave number calculation
+  int localZ = pos.z % gridSize;
+  float kz = getWaveNumber(localZ, gridSize, worldSize);
   float k2 = kx * kx + ky * ky + kz * kz;
   float geoFactor = -4.0 * PI;
 #endif
