@@ -1,13 +1,14 @@
 // Linear-Sparse-Grid Batched FFT Shader
-// Performs 2D FFT on X,Y axes while treating Z as batch dimension
+// For 2D: FFT on X,Y axes, Z is batch dimension (grid index)
+// For 3D: FFT on X,Y,Z axes (single grid at a time)
 // #version 460, DIM, N_GRIDS, GRID_SIZE injected by Python
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-layout(location = 0) uniform ivec3 tensorDimensions;  // (GRID_SIZE, GRID_SIZE, N_GRIDS)
+layout(location = 0) uniform int gridSize;
 layout(location = 1) uniform int stage;
 layout(location = 2) uniform int direction;  // 1 = forward, -1 = inverse
-layout(location = 3) uniform int axis;       // 0 = X, 1 = Y (never 2, Z is batch)
+layout(location = 3) uniform int axis;       // 0 = X, 1 = Y, 2 = Z (3D only)
 
 layout(rg32f, binding = 0) readonly uniform image3D inputTexture;
 layout(rg32f, binding = 1) writeonly uniform image3D outputTexture;
@@ -34,24 +35,20 @@ vec2 compute_twiddle(int k, int stageSize) {
     return vec2(c, s);
 }
 
-// Get index along the FFT axis (X or Y only)
 int get_axis_index(ivec3 pos) {
     if (axis == 0) return pos.x;
-    return pos.y;
+    if (axis == 1) return pos.y;
+    return pos.z;
 }
 
-// Set index along the FFT axis
 ivec3 set_axis_index(ivec3 pos, int idx) {
     if (axis == 0)
         pos.x = idx;
-    else
+    else if (axis == 1)
         pos.y = idx;
+    else
+        pos.z = idx;
     return pos;
-}
-
-int get_axis_size() {
-    if (axis == 0) return tensorDimensions.x;
-    return tensorDimensions.y;
 }
 
 uint bit_reverse(uint x, uint n) {
@@ -65,12 +62,13 @@ uint bit_reverse(uint x, uint n) {
 
 void main() {
     ivec3 pos = ivec3(gl_GlobalInvocationID);
+    ivec3 texSize = imageSize(inputTexture);
 
-    // Bounds check - Z is batch dimension (grid index)
-    if (any(greaterThanEqual(pos, tensorDimensions)))
+    // Bounds check
+    if (any(greaterThanEqual(pos, texSize)))
         return;
 
-    int axisSize = get_axis_size();
+    int axisSize = gridSize;
     int axisIndex = get_axis_index(pos);
 
     if (axisIndex >= axisSize)
@@ -91,11 +89,11 @@ void main() {
     int stageSize = 1 << stage;
     int halfStageSize = stageSize >> 1;
 
-    // Only N/2 threads needed - kill threads in second half
+    // Only N/2 threads needed
     if (axisIndex >= axisSize / 2)
         return;
 
-    // Correct Cooley-Tukey index mapping
+    // Cooley-Tukey index mapping
     int t = axisIndex;
     int i1 = (t / halfStageSize) * stageSize + (t % halfStageSize);
     int i2 = i1 + halfStageSize;
