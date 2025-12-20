@@ -969,7 +969,7 @@ class Simulation(mglw.WindowConfig):
         self.render_prog["m_view"].write(m_view.tobytes())
         self.render_prog["m_proj"].write(m_proj.tobytes())
 
-        # self.vao.render(moderngl.POINTS)
+        self.vao.render(moderngl.POINTS)
 
         # Debug grid rendering
         if self.show_grid_debug:
