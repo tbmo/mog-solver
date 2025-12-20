@@ -82,7 +82,7 @@ class Simulation(mglw.WindowConfig):
         self.dt = self.cfg["dt"]
 
         # Precompute diagonal offsets
-        self.offsets = self.compute_offsets()
+        self.offsets, self.rotations = self.compute_transforms()
 
         self.init_buffers()
         self.init_textures()
@@ -115,25 +115,128 @@ class Simulation(mglw.WindowConfig):
         )
         print(f"  Memory savings: {equiv_cells / total_cells:.1f}x")
 
-    def compute_offsets(self):
+    def get_octahedral_rotations(self):
+        """Returns all 24 proper rotations of a cube as 3x3 matrices."""
+        rotations = []
+
+        # All permutations of (x,y,z)
+        perms = [(0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)]
+
+        # All sign combinations
+        signs = [
+            (1, 1, 1),
+            (1, 1, -1),
+            (1, -1, 1),
+            (1, -1, -1),
+            (-1, 1, 1),
+            (-1, 1, -1),
+            (-1, -1, 1),
+            (-1, -1, -1),
+        ]
+
+        for perm in perms:
+            for sign in signs:
+                mat = np.zeros((3, 3), dtype="f4")
+                for i in range(3):
+                    mat[i, perm[i]] = sign[i]
+
+                # Only keep proper rotations (det = +1)
+                if np.linalg.det(mat) > 0:
+                    rotations.append(mat)
+
+        return rotations
+
+    def get_dihedral_rotations(self):
+        """Returns all 8 rotations/reflections of a square as 2x2 matrices (D4 group)."""
+        rotations = []
+
+        # 4 rotations (0, 90, 180, 270 degrees)
+        for k in range(4):
+            angle = k * np.pi / 2
+            c, s = np.cos(angle), np.sin(angle)
+            rot = np.array([[c, -s], [s, c]], dtype="f4")
+            rotations.append(rot)
+
+        # 4 reflections (across x, y, and two diagonals)
+        # Reflection across x-axis then rotate
+        reflect = np.array([[1, 0], [0, -1]], dtype="f4")
+        for k in range(4):
+            angle = k * np.pi / 2
+            c, s = np.cos(angle), np.sin(angle)
+            rot = np.array([[c, -s], [s, c]], dtype="f4")
+            rotations.append(rot @ reflect)
+
+        return rotations
+
+    def compute_transforms(self):
         """
-        Compute diagonal offsets for each grid.
-        For 2D: offset[i] = (i/n, i/n) * voxel_size
-        For 3D: offset[i] = (i/n, i/n, i/n) * voxel_size
+        Compute offset + rotation for each grid.
+        Uses tetrahedral offsets + octahedral rotations for 3D.
+        Uses diagonal offsets + dihedral rotations for 2D.
         """
-        offsets = np.zeros((self.n_grids, 4), dtype="f4")  # vec4 for alignment
-        for i in range(self.n_grids):
-            frac = i / self.n_grids
-            if self.dim == 2:
-                offsets[i] = [frac * self.voxel_size, frac * self.voxel_size, 0, 0]
-            else:  # 3D
-                offsets[i] = [
-                    frac * self.voxel_size,
-                    frac * self.voxel_size,
-                    frac * self.voxel_size,
-                    0,
-                ]
-        return offsets
+        offsets = np.zeros((self.n_grids, 4), dtype="f4")
+        # mat3 packed as 3 vec4s (12 floats) for 3D, mat2 packed as 2 vec2s (4 floats) for 2D
+        # Use 12 floats for both for simplicity (2D just uses top-left 2x2)
+        rotations = np.zeros((self.n_grids, 12), dtype="f4")
+
+        if self.dim == 2:
+            dihedral = self.get_dihedral_rotations()  # 8 rotations
+
+            # Square diagonal directions
+            diag_dirs = np.array(
+                [
+                    [1, 1],
+                    [1, -1],
+                    [-1, 1],
+                    [-1, -1],
+                ],
+                dtype="f4",
+            ) / np.sqrt(2)
+
+            for i in range(self.n_grids):
+                frac = i / self.n_grids
+
+                # Offset: diagonal direction
+                d = diag_dirs[i % 4]
+                offsets[i, 0:2] = frac * self.voxel_size * d
+
+                # Rotation: cycle through dihedral group
+                rot = dihedral[i % 8]
+                # Pack mat2 into first 4 floats (column-major for GLSL)
+                rotations[i, 0:2] = rot[:, 0]  # first column
+                rotations[i, 4:6] = rot[
+                    :, 1
+                ]  # second column (offset by 4 for vec4 alignment)
+
+        else:  # 3D
+            octahedral = self.get_octahedral_rotations()  # 24 rotations
+
+            # Tetrahedral offset directions (maximally symmetric)
+            tetra_dirs = np.array(
+                [
+                    [1, 1, 1],
+                    [1, -1, -1],
+                    [-1, 1, -1],
+                    [-1, -1, 1],
+                ],
+                dtype="f4",
+            ) / np.sqrt(3)
+
+            for i in range(self.n_grids):
+                frac = i / self.n_grids
+
+                # Offset: tetrahedral direction
+                d = tetra_dirs[i % 4]
+                offsets[i, 0:3] = frac * self.voxel_size * d
+
+                # Rotation: cycle through octahedral group
+                rot = octahedral[i % 24]
+                # Pack mat3 as 3 vec4s (column-major for GLSL)
+                rotations[i, 0:3] = rot[:, 0]  # first column
+                rotations[i, 4:7] = rot[:, 1]  # second column
+                rotations[i, 8:11] = rot[:, 2]  # third column
+
+        return offsets, rotations
 
     def load_config(self):
         cfg_path = Path(__file__).parent / "config.yaml"
@@ -158,6 +261,7 @@ class Simulation(mglw.WindowConfig):
 
         # Offset buffer for GPU access (vec4 aligned)
         self.offset_buf = self.ctx.buffer(self.offsets.tobytes())
+        self.rotation_buf = self.ctx.buffer(self.rotations.tobytes())
 
         # Mass buffer: one contiguous buffer for all grids
         # Layout: [grid0_cells..., grid1_cells..., ...]
@@ -236,64 +340,20 @@ class Simulation(mglw.WindowConfig):
         self.prog_update = self.ctx.compute_shader(load("update.glsl"))
 
     def init_particles(self):
-        """Initialize particles with multi-octave noise."""
+        """Initialize particles in a simple centered cluster."""
         pos = np.zeros((self.num_particles, 4), dtype="f4")
         vel = np.zeros((self.num_particles, 4), dtype="f4")
 
-        num_octaves = np.random.randint(2, 6)
-        base_freq = np.random.uniform(0.5, 4.0)
-        lacunarity = np.random.uniform(1.5, 3.0)
-        persistence = np.random.uniform(0.3, 0.7)
-        noise_strength = np.random.uniform(0.2, 0.5) * self.world_size
+        center = self.world_size / 2.0
+        spread = self.world_size * 0.2
 
-        offset = np.random.uniform(0, 1000, size=self.dim)
-
-        def perlin_octaves(coords):
-            total = np.zeros(len(coords))
-            freq = base_freq
-            amp = 1.0
-            max_amp = 0.0
-
-            for _ in range(num_octaves):
-                noise = np.ones(len(coords))
-                for d in range(coords.shape[1]):
-                    noise *= np.sin(freq * coords[:, d] + offset[d])
-                    noise += np.cos(freq * 1.7 * coords[:, d] + offset[d] * 0.7)
-                total += noise * amp
-                max_amp += amp
-                freq *= lacunarity
-                amp *= persistence
-
-            return total / max_amp
-
-        if np.random.random() < 0.5:
-            base_pos = (
-                np.random.uniform(0.1, 0.9, (self.num_particles, self.dim))
-                * self.world_size
-            )
-        else:
-            n_side = int(np.ceil(self.num_particles ** (1.0 / self.dim)))
-            grid = np.meshgrid(
-                *[np.linspace(0.1, 0.9, n_side) for _ in range(self.dim)]
-            )
-            base_pos = (
-                np.stack([g.flatten() for g in grid], axis=1)[: self.num_particles]
-                * self.world_size
-            )
-            base_pos += np.random.normal(0, self.world_size * 0.01, base_pos.shape)
-
-        for d in range(self.dim):
-            noise_coords = base_pos / self.world_size * base_freq + offset[d] * 100
-            displacement = perlin_octaves(noise_coords) * noise_strength
-            base_pos[:, d] += displacement
-
-        base_pos = np.clip(base_pos, 0.05 * self.world_size, 0.95 * self.world_size)
-
-        pos[:, : self.dim] = base_pos
+        pos[:, : self.dim] = center + np.random.uniform(
+            -spread, spread, (self.num_particles, self.dim)
+        )
         pos[:, 3] = self.cfg["particle_mass"]
 
-        self.vel_buf.write(vel.tobytes())
         self.pos_buf.write(pos.tobytes())
+        self.vel_buf.write(vel.tobytes())
 
     def init_render(self):
         self.render_prog = self.ctx.program(
@@ -569,6 +629,7 @@ class Simulation(mglw.WindowConfig):
         self.pos_buf.bind_to_storage_buffer(0)
         self.mass_buf.bind_to_storage_buffer(1)
         self.offset_buf.bind_to_storage_buffer(2)
+        self.rotation_buf.bind_to_storage_buffer(3)
         self.prog_mass["gridSize"] = gs
         self.prog_mass["nGrids"] = ng
         self.prog_mass["voxelSize"] = self.voxel_size
@@ -645,6 +706,7 @@ class Simulation(mglw.WindowConfig):
         self.pos_buf.bind_to_storage_buffer(0)
         self.mass_buf.bind_to_storage_buffer(1)
         self.offset_buf.bind_to_storage_buffer(2)
+        self.rotation_buf.bind_to_storage_buffer(3)
         set_uniform(self.prog_mass, "gridSize", gs)
         set_uniform(self.prog_mass, "nGrids", ng)
         set_uniform(self.prog_mass, "voxelSize", self.voxel_size)
@@ -653,7 +715,6 @@ class Simulation(mglw.WindowConfig):
         self.ctx.memory_barrier()
 
         # Process each grid independently for FFT to avoid spectral leakage
-        cells_per_grid = gs * gs * gs
 
         for grid_idx in range(ng):
             # Step B.1: Mass -> Complex for this grid
