@@ -1,56 +1,62 @@
-// #version and #define DIM injected by Python
+// Linear-Sparse-Grid Mass Scatter Shader
+// Scatters particle mass to ALL grids with diagonal offsets
+// #version 460, DIM, N_GRIDS, GRID_SIZE injected by Python
+
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer PositionBuffer {
-  vec4 positions[];
+    vec4 positions[];
 };
-layout(std430, binding = 1) buffer MassBuffer { uint mass_grid[]; };
 
-layout(location = 0) uniform ivec3 tensorDimensions;
+layout(std430, binding = 1) buffer MassBuffer {
+    uint mass_grid[];  // Flattened [N_GRIDS, GRID_SIZE, GRID_SIZE]
+};
+
+layout(std430, binding = 2) readonly buffer OffsetBuffer {
+    vec2 offsets[];  // [N_GRIDS] diagonal offsets in world space
+};
+
+layout(location = 0) uniform ivec3 tensorDimensions;  // (GRID_SIZE, GRID_SIZE, N_GRIDS)
 layout(location = 1) uniform float voxelSize;
+layout(location = 2) uniform float worldSize;
 
-// Generic coordinate wrapper
-#if DIM == 3
-#define IVEC_TYPE ivec3
-#define VEC_TYPE vec3
-#else
-#define IVEC_TYPE ivec2
-#define VEC_TYPE vec2
-#endif
-
-IVEC_TYPE worldToVoxel(VEC_TYPE worldPos) {
-  return IVEC_TYPE(worldPos / voxelSize);
+ivec2 worldToVoxel(vec2 worldPos) {
+    return ivec2(worldPos / voxelSize);
 }
 
 void main() {
-  uint gID = gl_GlobalInvocationID.x;
-  if (gID >= positions.length())
-    return;
+    uint gID = gl_GlobalInvocationID.x;
+    if (gID >= positions.length())
+        return;
 
-  vec4 particle = positions[gID];
+    vec4 particle = positions[gID];
+    vec2 basePos = particle.xy;
+    uint massInt = uint(particle.w * 1.0);
 
-// Extract relevant dimensions
-#if DIM == 3
-  VEC_TYPE p = particle.xyz;
-#else
-  VEC_TYPE p = particle.xy;
-#endif
+    int gridSizeX = tensorDimensions.x;
+    int gridSizeY = tensorDimensions.y;
+    int nGrids = tensorDimensions.z;
 
-  IVEC_TYPE voxelPos = worldToVoxel(p);
+    // Scatter to ALL grids with their respective offsets
+    for (int gridIdx = 0; gridIdx < nGrids; gridIdx++) {
+        // Apply offset: local_pos = particle.pos - offset[gridIdx]
+        vec2 localPos = basePos - offsets[gridIdx];
 
-// Wrap
-#if DIM == 3
-  voxelPos = (voxelPos % tensorDimensions.xyz + tensorDimensions.xyz) %
-             tensorDimensions.xyz;
-  // Flatten 3D index: z * (w*h) + y * w + x
-  int idx = voxelPos.z * (tensorDimensions.x * tensorDimensions.y) +
-            voxelPos.y * tensorDimensions.x + voxelPos.x;
-#else
-  voxelPos = (voxelPos % tensorDimensions.xy + tensorDimensions.xy) %
-             tensorDimensions.xy;
-  int idx = voxelPos.y * tensorDimensions.x + voxelPos.x;
-#endif
+        // Periodic boundary wrapping
+        localPos = mod(localPos, worldSize);
+        if (localPos.x < 0.0) localPos.x += worldSize;
+        if (localPos.y < 0.0) localPos.y += worldSize;
 
-  uint massInt = uint(particle.w * 1.0);
-  atomicAdd(mass_grid[idx], massInt);
+        // Convert to voxel coordinates
+        ivec2 voxelPos = worldToVoxel(localPos);
+
+        // Wrap voxel coordinates
+        voxelPos = (voxelPos % ivec2(gridSizeX, gridSizeY) + ivec2(gridSizeX, gridSizeY)) % ivec2(gridSizeX, gridSizeY);
+
+        // Flatten index: gridIdx * (gridSizeX * gridSizeY) + y * gridSizeX + x
+        int idx = gridIdx * (gridSizeX * gridSizeY) + voxelPos.y * gridSizeX + voxelPos.x;
+
+        // Atomic add mass
+        atomicAdd(mass_grid[idx], massInt);
+    }
 }

@@ -1,5 +1,7 @@
-dimensions: 3
-grid_size: 128
+dimensions: 2
+# Linear-Sparse-Grid Configuration
+n_grids: 16           # Number of offset grids (batch dimension)
+grid_size: 32         # Base resolution per grid (small, e.g., 32x32)
 world_size: 100.0
 num_particles: 1e4
 G: 1.0
