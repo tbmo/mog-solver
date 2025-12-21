@@ -413,9 +413,53 @@ class Simulation(mglw.WindowConfig):
         self.prog_fourier = self.ctx.compute_shader(load("fourier.glsl"))
         self.prog_pack = self.ctx.compute_shader(load("pack.glsl"))
         self.prog_update = self.ctx.compute_shader(load("update.glsl"))
+        self.prog_init_particles = self.ctx.compute_shader(load("init_particles.glsl"))
 
     def init_particles(self):
-        """Initialize particles in a simple centered cluster."""
+        """Initialize particles using GPU Perlin noise for non-uniform distribution."""
+        self.init_particles_gpu(
+            noise_scale=4.0,       # Noise frequency (higher = more clusters)
+            density_contrast=2.0,  # Clustering strength (higher = more clustered)
+            seed=None,             # Random seed (None = random)
+        )
+
+    def init_particles_gpu(self, noise_scale=4.0, density_contrast=2.0, seed=None, spawn_buffer=None):
+        """Initialize particles on GPU with Perlin noise density field.
+
+        Args:
+            noise_scale: Controls noise frequency. Higher = more/smaller clusters.
+            density_contrast: Controls clustering strength. 1.0 = uniform, higher = more clustered.
+            seed: Random seed for reproducibility. None = random seed.
+            spawn_buffer: Fraction of world_size to keep clear from edges (0.0-0.5). None = use config.
+        """
+        if seed is None:
+            seed = np.random.randint(0, 2**31)
+        if spawn_buffer is None:
+            spawn_buffer = self.cfg.get("spawn_buffer", 0.1)
+
+        n_particles = self.num_particles
+
+        # Bind buffers
+        self.pos_buf.bind_to_storage_buffer(0)
+        self.vel_buf.bind_to_storage_buffer(1)
+
+        # Set uniforms
+        self.prog_init_particles["numParticles"] = n_particles
+        self.prog_init_particles["worldSize"] = float(self.world_size)
+        self.prog_init_particles["noiseScale"] = float(noise_scale)
+        self.prog_init_particles["densityContrast"] = float(density_contrast)
+        self.prog_init_particles["seed"] = int(seed)
+        self.prog_init_particles["baseMass"] = float(self.cfg["particle_mass"])
+        self.prog_init_particles["spawnBuffer"] = float(spawn_buffer)
+
+        # Dispatch
+        self.prog_init_particles.run((n_particles + 255) // 256)
+        self.ctx.memory_barrier()
+
+        print(f"GPU init: {n_particles:,} particles, scale={noise_scale}, contrast={density_contrast}, buffer={spawn_buffer:.0%}")
+
+    def init_particles_cpu(self):
+        """Initialize particles in a simple centered cluster (CPU fallback)."""
         pos = np.zeros((self.num_particles, 4), dtype="f4")
         vel = np.zeros((self.num_particles, 4), dtype="f4")
 
@@ -986,7 +1030,19 @@ class Simulation(mglw.WindowConfig):
 
             elif key == keys.R:
                 self.init_particles()
-                print("Reset particles")
+                print("Reset particles (GPU Perlin)")
+
+            elif key == keys.NUMBER_1:
+                self.init_particles_gpu(noise_scale=2.0, density_contrast=1.5)
+                print("Preset 1: subtle clustering")
+
+            elif key == keys.NUMBER_2:
+                self.init_particles_gpu(noise_scale=4.0, density_contrast=2.5)
+                print("Preset 2: medium clustering")
+
+            elif key == keys.NUMBER_3:
+                self.init_particles_gpu(noise_scale=8.0, density_contrast=4.0)
+                print("Preset 3: tight clusters")
 
             elif key == keys.T:
                 self.init_particles2()
