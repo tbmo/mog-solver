@@ -468,6 +468,7 @@ class Simulation(mglw.WindowConfig):
         self.cam_dist = 3.0
         self.mouse_pressed = False
         self.show_grid_debug = False
+        self.show_particles = True
 
         effective_res = self.grid_size * self.n_grids
         total_cells = self.n_grids * (self.grid_size**self.dim)
@@ -1293,7 +1294,8 @@ class Simulation(mglw.WindowConfig):
         self.render_prog["m_view"].write(m_view.tobytes())
         self.render_prog["m_proj"].write(m_proj.tobytes())
 
-        self.vao.render(moderngl.POINTS)
+        if self.show_particles:
+            self.vao.render(moderngl.POINTS)
 
         if self.show_grid_debug:
             self.grid_debug_prog["m_view"].write(m_view.tobytes())
@@ -1346,6 +1348,10 @@ class Simulation(mglw.WindowConfig):
             elif key == keys.G:
                 self.show_grid_debug = not self.show_grid_debug
                 print(f"Grid debug: {'ON' if self.show_grid_debug else 'OFF'}")
+
+            elif key == keys.H:
+                self.show_particles = not self.show_particles
+                print(f"Particle rendering: {'ON' if self.show_particles else 'OFF'}")
 
 
 if __name__ == "__main__":
