@@ -1,12 +1,13 @@
 # Linear-Sparse-Grid Configuration
-n_grids: 240            # Number of offset grids, should be a multiple of 24 because crystals or something
+n_grids: 360            # Number of offset grids, should be a multiple of 24 because crystals or something
 grid_size: 16           # Base resolution per grid (16x16x16)
 world_size: 1000.0
 num_particles: 5e5
 G: 1.0
 dt: 0.00001
 particle_mass: 1.0
-damping: 0.995
+# damping: 0.995
+damping: 0.99
 
 # Solver type: "convolution" (direct) or "fft" (spectral)
 # solver: convolution
