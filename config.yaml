@@ -1,16 +1,16 @@
 # Linear-Sparse-Grid Configuration
-n_grids: 1000            # Number of offset grids, should be a multiple of 24 because crystals or something
-grid_size: 3           # Base resolution per grid (16x16x16)
-world_size: 100.0
+n_grids: 240            # Number of offset grids, should be a multiple of 24 because crystals or something
+grid_size: 16           # Base resolution per grid (16x16x16)
+world_size: 1000.0
 num_particles: 1e6
 G: 1.0
 dt: 0.00001
 particle_mass: 1.0
-damping: 0.9999         # Velocity damping per step (1.0 = no damping, 0.99 = light, 0.9 = heavy)
+damping: 0.99         # Velocity damping per step (1.0 = no damping, 0.99 = light, 0.9 = heavy)
 
 # Solver type: "convolution" (direct) or "fft" (spectral)
-solver: convolution
-# solver: fft
+# solver: convolution
+solver: fft
 
 # Particle initialization
 spawn_buffer: 0.2       # Fraction of world_size to keep clear from edges (0.0-0.5)
