@@ -1,6 +1,6 @@
 dimensions: 3
 # Linear-Sparse-Grid Configuration
-n_grids: 480            # Number of offset grids (reduced for 3D memory) should be a multiple of 24 because crystals or something
+n_grids: 16            # Number of offset grids (reduced for 3D memory) should be a multiple of 24 because crystals or something
 grid_size: 16         # Base resolution per grid (32x32x32)
 world_size: 100.0
 num_particles: 1e6
