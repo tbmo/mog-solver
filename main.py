@@ -39,14 +39,17 @@ class HierarchicalSE3Sampler:
         self._configs = []
         self._max_computed = 0
 
+        # Cache setup
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
         self.cache_key = self._compute_cache_key()
         self.cache_path = self.cache_dir / f"{self.cache_key}.pkl"
 
+        # Try to load from cache
         if self._load_cache():
             print(f"  Loaded {len(self._configs)} configs from cache")
 
+        # Auto-tune weights based on geometry
         self.w_rot, self.w_trans = self._compute_weights()
 
     def _compute_cache_key(self):
@@ -107,23 +110,40 @@ class HierarchicalSE3Sampler:
         W = self.world_size
         G = self.grid_size
 
+        # Characteristic length where rotation has effect
+        # Points near center don't move much under rotation
+        # Points at edge move a lot
+        # Use RMS distance from center: W/(2√3) for uniform cube
         char_radius = W / (2 * np.sqrt(3))
 
+        # Maximum displacement from rotation (full π rotation at char_radius)
         max_rot_displacement = char_radius * np.pi
 
+        # Maximum displacement from translation (voxel diagonal)
         max_trans_displacement = V * np.sqrt(3) / 2
 
+        # Ratio tells us relative importance
+        # If rot_displacement >> trans_displacement, translation matters more
+        # because small translations still matter while we've "saturated" rotations
         ratio = max_trans_displacement / max_rot_displacement
 
-        grid_factor = min(1.0, 60 / self.n_grids)
+        # Also consider: with many grids, we need finer discrimination
+        # More grids → we're slicing SO(3) finer → rotations more important
+        grid_factor = min(1.0, 60 / self.n_grids)  # diminishes above 60
 
-        coarseness = 32 / G
+        # Also: coarser grids (small G) → each voxel is larger →
+        # translations within voxel have more impact
+        coarseness = 32 / G  # normalized to "typical" grid size of 32
 
+        # Combine factors
+        # Base: rotation slightly more important
         base_rot = 0.6
         base_trans = 0.4
 
-        coarse_adjust = 0.15 * (coarseness - 1)
+        # Adjust for coarseness (coarser → more translation weight)
+        coarse_adjust = 0.15 * (coarseness - 1)  # ±0.15 adjustment
 
+        # Adjust for grid count (more grids → more rotation weight)
         count_adjust = 0.1 * (1 - grid_factor)
 
         w_rot = np.clip(base_rot - coarse_adjust + count_adjust, 0.3, 0.8)
@@ -160,9 +180,11 @@ class HierarchicalSE3Sampler:
         q1, off1 = c1
         q2, off2 = c2
 
+        # Rotation distance: geodesic on SO(3), normalized to [0, 1]
         dot = np.abs(np.dot(q1, q2))
         rot_dist = 2 * np.arccos(np.clip(dot, 0, 1)) / np.pi
 
+        # Translation distance: toroidal, normalized to [0, 1]
         diff = off1 - off2
         diff = diff - self.voxel_size * np.round(diff / self.voxel_size)
         trans_dist = np.linalg.norm(diff) / (self.voxel_size * np.sqrt(3) / 2)
@@ -184,20 +206,26 @@ class HierarchicalSE3Sampler:
         phi = (1 + np.sqrt(5)) / 2
         quats = []
 
+        # The 120 quaternions of the binary icosahedral group are:
+        # 1. ±1, ±i, ±j, ±k (8 quaternions)
         for val in [1, -1]:
             quats.append([val, 0, 0, 0])
             quats.append([0, val, 0, 0])
             quats.append([0, 0, val, 0])
             quats.append([0, 0, 0, val])
 
+        # 2. ½(±1 ± i ± j ± k) - all sign combinations (16 quaternions)
         for s0 in [1, -1]:
             for s1 in [1, -1]:
                 for s2 in [1, -1]:
                     for s3 in [1, -1]:
                         quats.append([0.5 * s0, 0.5 * s1, 0.5 * s2, 0.5 * s3])
 
+        # 3. ½(0, ±1, ±φ, ±1/φ) and all even permutations (96 quaternions)
+        # The values are 0, ±1, ±φ, ±1/φ
         coords = [0, 1, phi, 1 / phi]
 
+        # Even permutations of (0,1,2,3)
         even_perms = [
             (0, 1, 2, 3),
             (0, 2, 3, 1),
@@ -215,6 +243,7 @@ class HierarchicalSE3Sampler:
 
         for perm in even_perms:
             vals = [coords[perm[0]], coords[perm[1]], coords[perm[2]], coords[perm[3]]]
+            # All sign combinations for non-zero entries
             signs_list = [[1]]
             for v in vals[1:]:
                 if v == 0:
@@ -233,9 +262,11 @@ class HierarchicalSE3Sampler:
                         ]
                         quats.append(q)
 
+        # Normalize all
         quats = [np.array(q, dtype="f4") for q in quats]
         quats = [q / np.linalg.norm(q) for q in quats]
 
+        # Deduplicate and keep one from each ±q pair
         unique = []
         for q in quats:
             q = self._canonicalize_quat(q)
@@ -289,8 +320,9 @@ class HierarchicalSE3Sampler:
 
         icosa_quats = self.get_icosahedral_quaternions()
 
-        while self._max_computed < min(n, len(icosa_quats) * 4):
-            cycle = self._max_computed // 60
+        # Phase 1 & 2: Icosahedral rotations, multiple offset passes
+        while self._max_computed < min(n, len(icosa_quats) * 4):  # up to 240
+            cycle = self._max_computed // 60  # which pass through icosahedral
             idx = self._max_computed % 60
 
             q = icosa_quats[idx]
@@ -306,6 +338,7 @@ class HierarchicalSE3Sampler:
                     f"  Config {self._max_computed}: cycle={cycle}, min_dist={dist:.4f}"
                 )
 
+        # Phase 3: Full SE(3) sampling for anything beyond 240
         if n > self._max_computed:
             n_candidates = max(500, (n - self._max_computed) * 10)
             candidates = [self._random_config() for _ in range(n_candidates)]
@@ -340,13 +373,19 @@ class HierarchicalSE3Sampler:
                 if len(candidates) < (n - self._max_computed) * 3:
                     candidates.extend([self._random_config() for _ in range(300)])
 
+        # Save to cache after computation
         self._save_cache()
 
         return self._configs[:n]
 
-    def get_transforms(self, n=None, verbose=False):
+    def get_transforms(self, n=None, verbose=False, optimize=True):
         """
         Get (rotation_matrix, offset) pairs for grid transforms.
+
+        Args:
+            n: Number of transforms (default: self.n_grids)
+            verbose: Print progress
+            optimize: Run energy optimization after greedy (recommended)
 
         Returns:
             rotations: (n, 3, 3) array of rotation matrices
@@ -355,16 +394,126 @@ class HierarchicalSE3Sampler:
         if n is None:
             n = self.n_grids
 
+        # Check if we loaded from cache
+        already_cached = self._max_computed >= n
+
         configs = self.compute_hierarchical(n, verbose)
+
+        # Only optimize if we computed new configs (not loaded from cache)
+        if optimize and not already_cached:
+            if verbose:
+                print("  Running energy optimization...")
+            self.optimize_energy(n_iterations=500, verbose=verbose)
 
         rotations = np.zeros((n, 3, 3), dtype="f4")
         offsets = np.zeros((n, 3), dtype="f4")
 
-        for i, (q, off) in enumerate(configs):
+        for i, (q, off) in enumerate(self._configs[:n]):
             rotations[i] = self.quat_to_matrix(q)
             offsets[i] = off
 
         return rotations, offsets
+
+    def optimize_energy(self, n_iterations=500, verbose=True):
+        """
+        Refine configurations via energy minimization.
+
+        All configs repel each other with force ~ 1/distance².
+        This spreads them more evenly than greedy, reducing the
+        covering radius (max gap).
+        """
+        if len(self._configs) == 0:
+            return
+
+        n = len(self._configs)
+
+        quats = np.array([c[0] for c in self._configs])
+        offs = np.array([c[1] for c in self._configs])
+
+        lr_quat = 0.002
+        lr_off = 0.005 * self.voxel_size
+
+        best_energy = float("inf")
+        best_quats = quats.copy()
+        best_offs = offs.copy()
+
+        for iteration in range(n_iterations):
+            quat_grads = np.zeros_like(quats)
+            off_grads = np.zeros_like(offs)
+            total_energy = 0
+
+            for i in range(n):
+                for j in range(i + 1, n):
+                    # Rotation distance
+                    dot = np.dot(quats[i], quats[j])
+                    sign = np.sign(dot) if dot != 0 else 1
+                    dot_abs = np.abs(dot)
+                    rot_dist = 2 * np.arccos(np.clip(dot_abs, 0, 0.9999))
+
+                    # Translation distance (toroidal)
+                    off_diff = offs[i] - offs[j]
+                    off_diff = off_diff - self.voxel_size * np.round(
+                        off_diff / self.voxel_size
+                    )
+                    trans_dist = np.linalg.norm(off_diff) + 1e-8
+
+                    # Combined distance
+                    dist = self.w_rot * rot_dist / np.pi + self.w_trans * trans_dist / (
+                        self.voxel_size * 0.866
+                    )
+                    dist = max(dist, 0.01)
+
+                    # Energy and force magnitude
+                    total_energy += 1.0 / dist
+                    force = 1.0 / (dist * dist)
+
+                    # Quaternion repulsion (push i away from j)
+                    quat_diff = quats[i] - sign * quats[j]
+                    quat_diff_norm = np.linalg.norm(quat_diff) + 1e-8
+                    quat_grads[i] += force * quat_diff / quat_diff_norm
+                    quat_grads[j] -= force * sign * quat_diff / quat_diff_norm
+
+                    # Offset repulsion
+                    off_grads[i] += force * off_diff / trans_dist
+                    off_grads[j] -= force * off_diff / trans_dist
+
+            # Apply gradients
+            quats += lr_quat * quat_grads
+            offs += lr_off * off_grads
+
+            # Project quats to S³
+            quats = quats / np.linalg.norm(quats, axis=1, keepdims=True)
+
+            # Canonicalize
+            for i in range(n):
+                for k in range(4):
+                    if abs(quats[i, k]) > 1e-6:
+                        if quats[i, k] < 0:
+                            quats[i] = -quats[i]
+                        break
+
+            # Wrap offsets
+            offs = offs % self.voxel_size
+
+            # Track best
+            if total_energy < best_energy:
+                best_energy = total_energy
+                best_quats = quats.copy()
+                best_offs = offs.copy()
+
+            lr_quat *= 0.998
+            lr_off *= 0.998
+
+            if verbose and (iteration + 1) % 100 == 0:
+                print(
+                    f"  Energy iter {iteration + 1}: energy={total_energy:.2f}, best={best_energy:.2f}"
+                )
+
+        self._configs = [(best_quats[i], best_offs[i]) for i in range(n)]
+        self._save_cache()
+
+        if verbose:
+            print(f"  Energy optimization complete. Best energy: {best_energy:.2f}")
 
     def analyze_coverage(self, n=None):
         """Analyze the quality of the configuration set."""
@@ -372,6 +521,7 @@ class HierarchicalSE3Sampler:
             n = len(self._configs)
         configs = self._configs[:n]
 
+        # Pairwise distance statistics
         dists = []
         for i in range(n):
             for j in range(i + 1, n):
@@ -385,6 +535,7 @@ class HierarchicalSE3Sampler:
         print(f"  Max pairwise distance: {dists.max():.4f}")
         print(f"  Std pairwise distance: {dists.std():.4f}")
 
+        # Covering radius estimate (max gap)
         test_configs = [self._random_config() for _ in range(1000)]
         max_gap = max(self.min_distance_to_set(c) for c in test_configs)
         print(f"  Estimated covering radius: {max_gap:.4f}")
@@ -604,6 +755,7 @@ class Simulation(mglw.WindowConfig):
         return rotations
 
     def compute_transforms(self):
+        """Drop-in replacement for Simulation.compute_transforms()"""
         offsets = np.zeros((self.n_grids, 4), dtype="f4")
         rotations = np.zeros((self.n_grids, 12), dtype="f4")
 
@@ -899,8 +1051,12 @@ class Simulation(mglw.WindowConfig):
         self.grid_debug_prog["world_size"] = self.world_size
         self.init_grid_debug_geometry()
 
-    def init_grid_debug_geometry(self):
-        """Create single-cell geometry for each grid to visualize offsets and rotations."""
+    def init_grid_debug_geometry(self, cells_per_axis=3, max_grids=None):
+        """Create multi-cell geometry for each grid to visualize tiling.
+
+        Args:
+            cells_per_axis: How many cells to draw per axis (e.g., 3 = 3x3x3 = 27 cells per grid)
+        """
 
         def hsv_to_rgb(h, s, v):
             i = int(h * 6)
@@ -921,16 +1077,19 @@ class Simulation(mglw.WindowConfig):
 
         vs = self.voxel_size
         center = self.world_size / 2.0
+        half_extent = cells_per_axis // 2
 
         positions = []
         colors = []
 
-        for grid_idx in range(self.n_grids):
+        n_to_draw = max_grids if max_grids else self.n_grids
+
+        for grid_idx in range(min(n_to_draw, self.n_grids)):
             hue = (grid_idx * 0.618033988749895) % 1.0
             r, g, b = hsv_to_rgb(hue, 0.8, 0.9)
             color = (r, g, b)
-            offset = self.offsets[grid_idx][: self.dim]
 
+            offset = self.offsets[grid_idx][: self.dim]
             rot_data = self.rotations[grid_idx]
 
             if self.dim == 2:
@@ -938,41 +1097,44 @@ class Simulation(mglw.WindowConfig):
                     [[rot_data[0], rot_data[4]], [rot_data[1], rot_data[5]]], dtype="f4"
                 )
 
-                corners = np.array(
-                    [
-                        [0, 0],
-                        [vs, 0],
-                        [vs, vs],
-                        [0, vs],
-                    ],
-                    dtype="f4",
-                )
+                # Draw multiple cells centered around world center
+                for cx in range(-half_extent, half_extent + 1):
+                    for cy in range(-half_extent, half_extent + 1):
+                        # Cell corner in grid space (before rotation)
+                        cell_origin = np.array([cx * vs, cy * vs], dtype="f4")
 
-                cell_center = np.array([vs / 2, vs / 2], dtype="f4")
-                rotated_corners = []
-                for c in corners:
-                    local = c - cell_center
-                    rotated = rot @ local
-                    world = (
-                        rotated
-                        + cell_center
-                        + np.array([center + offset[0], center + offset[1]], dtype="f4")
-                    )
-                    rotated_corners.append(world)
+                        corners = np.array(
+                            [
+                                cell_origin + [0, 0],
+                                cell_origin + [vs, 0],
+                                cell_origin + [vs, vs],
+                                cell_origin + [0, vs],
+                            ],
+                            dtype="f4",
+                        )
 
-                positions.extend(
-                    [
-                        [rotated_corners[0][0], rotated_corners[0][1], 0],
-                        [rotated_corners[1][0], rotated_corners[1][1], 0],
-                        [rotated_corners[1][0], rotated_corners[1][1], 0],
-                        [rotated_corners[2][0], rotated_corners[2][1], 0],
-                        [rotated_corners[2][0], rotated_corners[2][1], 0],
-                        [rotated_corners[3][0], rotated_corners[3][1], 0],
-                        [rotated_corners[3][0], rotated_corners[3][1], 0],
-                        [rotated_corners[0][0], rotated_corners[0][1], 0],
-                    ]
-                )
-                colors.extend([color] * 8)
+                        # Rotate around world center and apply offset
+                        rotated_corners = []
+                        for c in corners:
+                            rotated = rot @ c
+                            world = rotated + np.array(
+                                [center + offset[0], center + offset[1]], dtype="f4"
+                            )
+                            rotated_corners.append(world)
+
+                        positions.extend(
+                            [
+                                [rotated_corners[0][0], rotated_corners[0][1], 0],
+                                [rotated_corners[1][0], rotated_corners[1][1], 0],
+                                [rotated_corners[1][0], rotated_corners[1][1], 0],
+                                [rotated_corners[2][0], rotated_corners[2][1], 0],
+                                [rotated_corners[2][0], rotated_corners[2][1], 0],
+                                [rotated_corners[3][0], rotated_corners[3][1], 0],
+                                [rotated_corners[3][0], rotated_corners[3][1], 0],
+                                [rotated_corners[0][0], rotated_corners[0][1], 0],
+                            ]
+                        )
+                        colors.extend([color] * 8)
             else:
                 rot = np.array(
                     [
@@ -983,57 +1145,71 @@ class Simulation(mglw.WindowConfig):
                     dtype="f4",
                 )
 
-                corners = np.array(
-                    [
-                        [0, 0, 0],
-                        [vs, 0, 0],
-                        [0, vs, 0],
-                        [vs, vs, 0],
-                        [0, 0, vs],
-                        [vs, 0, vs],
-                        [0, vs, vs],
-                        [vs, vs, vs],
-                    ],
-                    dtype="f4",
-                )
-
-                cell_center = np.array([vs / 2, vs / 2, vs / 2], dtype="f4")
                 world_offset = np.array(
                     [center + offset[0], center + offset[1], center + offset[2]],
                     dtype="f4",
                 )
-                rotated_corners = []
-                for c in corners:
-                    local = c - cell_center
-                    rotated = rot @ local
-                    world = rotated + cell_center + world_offset
-                    rotated_corners.append(world)
 
-                edges = [
-                    (0, 1),
-                    (0, 2),
-                    (0, 4),
-                    (1, 3),
-                    (1, 5),
-                    (2, 3),
-                    (2, 6),
-                    (3, 7),
-                    (4, 5),
-                    (4, 6),
-                    (5, 7),
-                    (6, 7),
-                ]
-                for i, j in edges:
-                    positions.extend(
-                        [
-                            list(rotated_corners[i]),
-                            list(rotated_corners[j]),
-                        ]
-                    )
-                colors.extend([color] * 24)
+                # Draw multiple cells centered around world center
+                for cx in range(-half_extent, half_extent + 1):
+                    for cy in range(-half_extent, half_extent + 1):
+                        for cz in range(-half_extent, half_extent + 1):
+                            # Cell origin in grid space
+                            cell_origin = np.array(
+                                [cx * vs, cy * vs, cz * vs], dtype="f4"
+                            )
+
+                            corners = np.array(
+                                [
+                                    cell_origin + [0, 0, 0],
+                                    cell_origin + [vs, 0, 0],
+                                    cell_origin + [0, vs, 0],
+                                    cell_origin + [vs, vs, 0],
+                                    cell_origin + [0, 0, vs],
+                                    cell_origin + [vs, 0, vs],
+                                    cell_origin + [0, vs, vs],
+                                    cell_origin + [vs, vs, vs],
+                                ],
+                                dtype="f4",
+                            )
+
+                            # Rotate around origin and translate
+                            rotated_corners = []
+                            for c in corners:
+                                rotated = rot @ c
+                                world = rotated + world_offset
+                                rotated_corners.append(world)
+
+                            edges = [
+                                (0, 1),
+                                (0, 2),
+                                (0, 4),
+                                (1, 3),
+                                (1, 5),
+                                (2, 3),
+                                (2, 6),
+                                (3, 7),
+                                (4, 5),
+                                (4, 6),
+                                (5, 7),
+                                (6, 7),
+                            ]
+                            for i, j in edges:
+                                positions.extend(
+                                    [
+                                        list(rotated_corners[i]),
+                                        list(rotated_corners[j]),
+                                    ]
+                                )
+                            colors.extend([color] * 24)
 
         positions = np.array(positions, dtype="f4")
         colors = np.array(colors, dtype="f4")
+
+        print(
+            f"Grid debug: {len(positions)} vertices for {self.n_grids} grids × {cells_per_axis}^{self.dim} cells"
+        )
+
         pos_buf = self.ctx.buffer(positions.tobytes())
         color_buf = self.ctx.buffer(colors.tobytes())
         self.grid_debug_vao = self.ctx.vertex_array(
