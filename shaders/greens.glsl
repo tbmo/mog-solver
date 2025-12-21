@@ -10,7 +10,7 @@ layout(location = 0) uniform int gridSize;
 layout(location = 1) uniform int nGrids;
 layout(location = 2) uniform float G;
 layout(location = 3) uniform float worldSize;
-layout(location = 4) uniform float epsilon = 1e-3;
+layout(location = 4) uniform float epsilon = 2e-3;
 
 layout(rg32f, binding = 0) readonly uniform image3D inputTexture;
 layout(rg32f, binding = 1) writeonly uniform image3D outGradX;
@@ -40,17 +40,12 @@ void main() {
   float kx = getWaveNumber(pos.x, gridSize, worldSize);
   float ky = getWaveNumber(pos.y, gridSize, worldSize);
 
-#if DIM == 2
-  float k2 = kx * kx + ky * ky;
-  float geoFactor = -2.0 * PI;
-#else
   // 3D: pos.z encodes gridIdx * gridSize + localZ
   // We need localZ for the wave number calculation
   int localZ = pos.z % gridSize;
   float kz = getWaveNumber(localZ, gridSize, worldSize);
   float k2 = kx * kx + ky * ky + kz * kz;
   float geoFactor = -4.0 * PI;
-#endif
 
   vec2 rhoHat = imageLoad(inputTexture, pos).xy;
   vec2 phiHat = vec2(0.0);
@@ -65,8 +60,6 @@ void main() {
   imageStore(outGradX, pos, vec4(gradXHat, 0.0, 0.0));
   imageStore(outGradY, pos, vec4(gradYHat, 0.0, 0.0));
 
-#if DIM == 3
   vec2 gradZHat = mult_ik(phiHat, kz);
   imageStore(outGradZ, pos, vec4(gradZHat, 0.0, 0.0));
-#endif
 }
