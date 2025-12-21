@@ -8,3 +8,6 @@ num_particles: 5e6
 G: 1.0
 dt: 0.00001
 particle_mass: 1.0
+
+# Particle initialization
+spawn_buffer: 0.1      # Fraction of world_size to keep clear from edges (0.0-0.5)
