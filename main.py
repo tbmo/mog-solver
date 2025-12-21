@@ -17,6 +17,216 @@ from pathlib import Path
 import yaml
 
 
+class HierarchicalSO3Sampler:
+    """
+    Generates rotations that hierarchically subdivide SO(3).
+
+    Each new rotation is placed to maximally fill gaps left by previous ones,
+    so rotations 0..n are always an optimal-ish covering for that count.
+
+    Uses quaternions on S³ (double cover of SO(3)).
+    """
+
+    def __init__(self, seed=42):
+        self.rng = np.random.default_rng(seed)
+        # Cache of computed quaternions for hierarchical access
+        self._quaternions = []
+        self._max_computed = 0
+
+    def quat_to_matrix(self, q):
+        """Convert unit quaternion [w,x,y,z] to 3x3 rotation matrix."""
+        w, x, y, z = q
+        return np.array(
+            [
+                [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+            ],
+            dtype="f4",
+        )
+
+    def geodesic_distance(self, q1, q2):
+        """
+        Geodesic distance on SO(3) between two quaternions.
+        Returns angle in radians [0, π].
+        """
+        # q and -q represent same rotation, take the closer one
+        dot = np.abs(np.dot(q1, q2))
+        return 2 * np.arccos(np.clip(dot, 0, 1))
+
+    def min_distance_to_set(self, q, quats):
+        """Minimum geodesic distance from q to any quaternion in quats."""
+        if len(quats) == 0:
+            return np.pi  # max possible
+        dots = np.abs(np.array([np.dot(q, qi) for qi in quats]))
+        return 2 * np.arccos(np.clip(np.max(dots), 0, 1))
+
+    def get_icosahedral_quaternions(self):
+        """
+        The 120 unit quaternions forming the binary icosahedral group.
+        These are vertices of the 600-cell and give the 60 icosahedral
+        rotations (pairs ±q give same rotation).
+        """
+        phi = (1 + np.sqrt(5)) / 2
+        quats = []
+
+        # 8 quaternions: (±1, 0, 0, 0) and permutations - half of 16-cell
+        for i in range(4):
+            q = [0, 0, 0, 0]
+            q[i] = 1
+            quats.append(q)
+
+        # 16 quaternions: ½(±1, ±1, ±1, ±1) - half of 8-cell
+        for signs in [
+            (1, 1, 1, 1),
+            (1, 1, -1, -1),
+            (1, -1, 1, -1),
+            (1, -1, -1, 1),
+            (-1, 1, 1, -1),
+            (-1, 1, -1, 1),
+            (-1, -1, 1, 1),
+            (-1, -1, -1, -1),
+        ]:
+            quats.append([0.5 * s for s in signs])
+
+        # 96 quaternions from even permutations of ½(0, ±1, ±1/φ, ±φ)
+        coords = [0, 1, 1 / phi, phi]
+        # Generate even permutations
+        even_perms = [
+            (0, 1, 2, 3),
+            (0, 2, 3, 1),
+            (0, 3, 1, 2),
+            (1, 0, 3, 2),
+            (1, 2, 0, 3),
+            (1, 3, 2, 0),
+            (2, 0, 1, 3),
+            (2, 1, 3, 0),
+            (2, 3, 0, 1),
+            (3, 0, 2, 1),
+            (3, 1, 0, 2),
+            (3, 2, 1, 0),
+        ]
+
+        for perm in even_perms:
+            base = [coords[perm[0]], coords[perm[1]], coords[perm[2]], coords[perm[3]]]
+            # All sign combinations where first nonzero is positive (to get half)
+            for s1 in [1] if base[1] == 0 else [1, -1]:
+                for s2 in [1] if base[2] == 0 else [1, -1]:
+                    for s3 in [1] if base[3] == 0 else [1, -1]:
+                        q = [
+                            0.5 * base[0],
+                            0.5 * s1 * base[1],
+                            0.5 * s2 * base[2],
+                            0.5 * s3 * base[3],
+                        ]
+                        quats.append(q)
+
+        # Normalize and deduplicate
+        quats = np.array(quats, dtype="f4")
+        quats = quats / np.linalg.norm(quats, axis=1, keepdims=True)
+
+        # Remove duplicates and keep only one of each ±q pair
+        unique = []
+        for q in quats:
+            is_dup = False
+            for uq in unique:
+                if np.abs(np.abs(np.dot(q, uq)) - 1) < 1e-6:
+                    is_dup = True
+                    break
+            if not is_dup:
+                # Canonicalize: ensure w > 0 (or if w=0, x > 0, etc.)
+                for i in range(4):
+                    if abs(q[i]) > 1e-6:
+                        if q[i] < 0:
+                            q = -q
+                        break
+                unique.append(q)
+
+        return np.array(unique[:60], dtype="f4")  # Should be exactly 60
+
+    def compute_hierarchical(self, n):
+        """
+        Compute n quaternions where each successive one maximally
+        subdivides the space covered by previous ones.
+        """
+        if n <= self._max_computed:
+            return self._quaternions[:n]
+
+        # Start with icosahedral if we have room
+        if self._max_computed == 0:
+            icosa = self.get_icosahedral_quaternions()
+            if n <= 60:
+                self._quaternions = list(icosa[:n])
+            else:
+                self._quaternions = list(icosa)
+            self._max_computed = len(self._quaternions)
+
+        # For remaining slots, use greedy farthest-point sampling
+        # Generate candidate pool
+        n_candidates = max(1000, n * 20)
+        candidates = self._random_quaternions(n_candidates)
+
+        while self._max_computed < n:
+            # Find candidate farthest from all existing
+            best_dist = -1
+            best_q = None
+
+            for q in candidates:
+                d = self.min_distance_to_set(q, self._quaternions)
+                if d > best_dist:
+                    best_dist = d
+                    best_q = q
+
+            self._quaternions.append(best_q)
+            self._max_computed += 1
+
+            # Remove nearby candidates to speed up search
+            candidates = [
+                q
+                for q in candidates
+                if self.geodesic_distance(q, best_q) > best_dist * 0.3
+            ]
+
+            # Replenish if running low
+            if len(candidates) < n * 5:
+                candidates.extend(self._random_quaternions(500))
+
+        return self._quaternions[:n]
+
+    def _random_quaternions(self, n):
+        """Generate n uniformly random unit quaternions."""
+        # Gaussian in 4D, then normalize = uniform on S³
+        q = self.rng.standard_normal((n, 4)).astype("f4")
+        q = q / np.linalg.norm(q, axis=1, keepdims=True)
+        # Canonicalize to positive hemisphere
+        for i in range(n):
+            for j in range(4):
+                if abs(q[i, j]) > 1e-6:
+                    if q[i, j] < 0:
+                        q[i] = -q[i]
+                    break
+        return list(q)
+
+    def get_rotations(self, n):
+        """Get n hierarchically-placed rotation matrices."""
+        quats = self.compute_hierarchical(n)
+        return [self.quat_to_matrix(q) for q in quats]
+
+    def get_covering_radius(self, n):
+        """
+        Compute the covering radius: max distance from any point in SO(3)
+        to the nearest rotation in our set. Smaller = better coverage.
+        """
+        quats = self.compute_hierarchical(n)
+        # Sample random points and find max min-distance
+        test_points = self._random_quaternions(10000)
+        max_min_dist = 0
+        for q in test_points:
+            d = self.min_distance_to_set(q, quats)
+            max_min_dist = max(max_min_dist, d)
+        return max_min_dist
+
+
 def set_uniform(prog, name, value):
     """Set uniform only if it exists (wasn't optimized out)."""
     if name in prog:
@@ -240,73 +450,55 @@ class Simulation(mglw.WindowConfig):
 
         return rotations
 
+    # Integration with your Simulation class:
     def compute_transforms(self):
+        """Updated compute_transforms using hierarchical SO(3) sampling."""
         offsets = np.zeros((self.n_grids, 4), dtype="f4")
         rotations = np.zeros((self.n_grids, 12), dtype="f4")
 
         if self.dim == 2:
-            # Keep dihedral for 2D
+            # Keep original 2D logic
             dihedral = self.get_dihedral_rotations()
             diag_dirs = np.array(
-                [
-                    [1, 1],
-                    [1, -1],
-                    [-1, 1],
-                    [-1, -1],
-                ],
-                dtype="f4",
+                [[1, 1], [1, -1], [-1, 1], [-1, -1]], dtype="f4"
             ) / np.sqrt(2)
 
             for i in range(self.n_grids):
                 frac = i / self.n_grids
-                d = diag_dirs[i % 4]
-                offsets[i, 0:2] = frac * self.voxel_size * d
+                offsets[i, 0:2] = frac * self.voxel_size * diag_dirs[i % 4]
                 rot = dihedral[i % 8]
                 rotations[i, 0:2] = rot[:, 0]
                 rotations[i, 4:6] = rot[:, 1]
 
-        else:  # 3D
-            icosahedral = self.get_icosahedral_rotations()  # 60 rotations
+        else:  # 3D - use hierarchical SO(3) sampling
+            sampler = HierarchicalSO3Sampler(seed=12345)
+            rot_matrices = sampler.get_rotations(self.n_grids)
 
-            # Golden ratio offset directions - 20 vertices of dodecahedron
-            # (dual to icosahedron, same symmetry group)
-            phi = (1 + np.sqrt(5)) / 2
-            dodeca_verts = np.array(
-                [
-                    [1, 1, 1],
-                    [1, 1, -1],
-                    [1, -1, 1],
-                    [1, -1, -1],
-                    [-1, 1, 1],
-                    [-1, 1, -1],
-                    [-1, -1, 1],
-                    [-1, -1, -1],
-                    [0, phi, 1 / phi],
-                    [0, phi, -1 / phi],
-                    [0, -phi, 1 / phi],
-                    [0, -phi, -1 / phi],
-                    [1 / phi, 0, phi],
-                    [1 / phi, 0, -phi],
-                    [-1 / phi, 0, phi],
-                    [-1 / phi, 0, -phi],
-                    [phi, 1 / phi, 0],
-                    [phi, -1 / phi, 0],
-                    [-phi, 1 / phi, 0],
-                    [-phi, -1 / phi, 0],
-                ],
-                dtype="f4",
-            )
-            dodeca_verts /= np.linalg.norm(dodeca_verts[0])
-
+            # For offsets, use the rotation axes as offset directions
+            # This couples offset direction to rotation, maximizing coverage diversity
             for i in range(self.n_grids):
                 frac = i / self.n_grids
+                rot = rot_matrices[i]
 
-                # Offset: cycle through dodecahedron vertices
-                d = dodeca_verts[i % 20]
-                offsets[i, 0:3] = frac * self.voxel_size * d
+                # Extract axis from rotation matrix via quaternion
+                # The offset direction could also be independent - see alternative below
+                trace = rot[0, 0] + rot[1, 1] + rot[2, 2]
+                angle = np.arccos(np.clip((trace - 1) / 2, -1, 1))
 
-                # Rotation: cycle through icosahedral group
-                rot = icosahedral[i % 60]
+                if angle < 1e-6:
+                    axis = np.array([1, 0, 0], dtype="f4")
+                else:
+                    axis = np.array(
+                        [
+                            rot[2, 1] - rot[1, 2],
+                            rot[0, 2] - rot[2, 0],
+                            rot[1, 0] - rot[0, 1],
+                        ],
+                        dtype="f4",
+                    )
+                    axis = axis / (np.linalg.norm(axis) + 1e-8)
+
+                offsets[i, 0:3] = frac * self.voxel_size * axis
                 rotations[i, 0:3] = rot[:, 0]
                 rotations[i, 4:7] = rot[:, 1]
                 rotations[i, 8:11] = rot[:, 2]
@@ -418,12 +610,14 @@ class Simulation(mglw.WindowConfig):
     def init_particles(self):
         """Initialize particles using GPU Perlin noise for non-uniform distribution."""
         self.init_particles_gpu(
-            noise_scale=4.0,       # Noise frequency (higher = more clusters)
+            noise_scale=4.0,  # Noise frequency (higher = more clusters)
             density_contrast=2.0,  # Clustering strength (higher = more clustered)
-            seed=None,             # Random seed (None = random)
+            seed=None,  # Random seed (None = random)
         )
 
-    def init_particles_gpu(self, noise_scale=4.0, density_contrast=2.0, seed=None, spawn_buffer=None):
+    def init_particles_gpu(
+        self, noise_scale=4.0, density_contrast=2.0, seed=None, spawn_buffer=None
+    ):
         """Initialize particles on GPU with Perlin noise density field.
 
         Args:
@@ -456,7 +650,9 @@ class Simulation(mglw.WindowConfig):
         self.prog_init_particles.run((n_particles + 255) // 256)
         self.ctx.memory_barrier()
 
-        print(f"GPU init: {n_particles:,} particles, scale={noise_scale}, contrast={density_contrast}, buffer={spawn_buffer:.0%}")
+        print(
+            f"GPU init: {n_particles:,} particles, scale={noise_scale}, contrast={density_contrast}, buffer={spawn_buffer:.0%}"
+        )
 
     def init_particles_cpu(self):
         """Initialize particles in a simple centered cluster (CPU fallback)."""
