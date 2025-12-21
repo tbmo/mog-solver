@@ -10,331 +10,161 @@ import moderngl
 import moderngl_window as mglw
 from pathlib import Path
 import yaml
-import pickle
-import hashlib
 
 
-class HierarchicalSE3Sampler:
+class FastSE3Sampler:
     """
-    Jointly optimizes rotation + translation for grid sampling.
-
-    The configuration space is SO(3) × T³ where T³ is the 3-torus of
-    translations mod voxel_size. We want each (rotation, offset) pair
-    to create a maximally different grid tessellation of space.
+    Deterministic SE(3) sampler using 6D Halton Sequences.
+    Maps [0,1]^6 -> SO(3) x [0,voxel]^3
     """
 
-    def __init__(self, grid_size, world_size, n_grids, seed=42, cache_dir=".se3_cache"):
+    def __init__(self, grid_size, world_size, n_grids, seed=None):
+        # Seed is unused for Halton (it's deterministic), but kept for API compatibility
         self.grid_size = grid_size
         self.world_size = world_size
         self.voxel_size = world_size / grid_size
         self.n_grids = n_grids
-        self.seed = seed
-        self.rng = np.random.default_rng(seed)
-        self._configs = []
-        self._max_computed = 0
 
-        self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(exist_ok=True)
-        self.cache_key = self._compute_cache_key()
-        self.cache_path = self.cache_dir / f"{self.cache_key}.pkl"
+        self._rotations = None
+        self._offsets = None
+        self._quats = None
 
-        if self._load_cache():
-            print(f"  Loaded {len(self._configs)} configs from cache")
+    def _halton_sequence(self, index, base):
+        """
+        Computes the n-th term of the Halton sequence for a given base.
+        Returns a float in [0, 1).
+        """
+        result = 0.0
+        f = 1.0 / base
+        i = index
+        while i > 0:
+            result += f * (i % base)
+            i //= base
+            f /= base
+        return result
 
-        self.w_rot, self.w_trans = self._compute_weights()
+    def generate_deterministic(self):
+        n = self.n_grids
 
-    def _compute_cache_key(self):
-        params = f"gs{self.grid_size}_ws{self.world_size}_ng{self.n_grids}_s{self.seed}"
-        return hashlib.md5(params.encode()).hexdigest()[:12]
+        # We need 6 dimensions: 3 for Rotation, 3 for Translation.
+        # We use the first 6 prime numbers as bases to ensure independence.
+        # Bases: 2, 3, 5 (Rotation), 7, 11, 13 (Translation)
 
-    def _load_cache(self):
-        if self.cache_path.exists():
-            try:
-                with open(self.cache_path, "rb") as f:
-                    data = pickle.load(f)
-                    self._configs = data["configs"]
-                    self._max_computed = data["max_computed"]
-                    return True
-            except Exception as e:
-                print(f"  Cache load failed: {e}")
-        return False
+        # 1. Generate the raw 6D sequence
+        # We skip the first 100 to avoid the initial "clump" near zero common in Halton
+        start_idx = 100
 
-    def _save_cache(self):
-        try:
-            with open(self.cache_path, "wb") as f:
-                pickle.dump(
-                    {
-                        "configs": self._configs,
-                        "max_computed": self._max_computed,
-                        "params": {
-                            "grid_size": self.grid_size,
-                            "world_size": self.world_size,
-                            "n_grids": self.n_grids,
-                            "seed": self.seed,
-                        },
-                    },
-                    f,
-                )
-            print(f"  Saved {len(self._configs)} configs to cache")
-        except Exception as e:
-            print(f"  Cache save failed: {e}")
+        # Dimensions 0-2: Rotation parameters
+        u1 = np.array(
+            [self._halton_sequence(i, 2) for i in range(start_idx, start_idx + n)]
+        )
+        u2 = np.array(
+            [self._halton_sequence(i, 3) for i in range(start_idx, start_idx + n)]
+        )
+        u3 = np.array(
+            [self._halton_sequence(i, 5) for i in range(start_idx, start_idx + n)]
+        )
 
-    def _compute_weights(self):
-        V = self.voxel_size
-        W = self.world_size
-        G = self.grid_size
+        # Dimensions 3-5: Translation parameters
+        v1 = np.array(
+            [self._halton_sequence(i, 7) for i in range(start_idx, start_idx + n)]
+        )
+        v2 = np.array(
+            [self._halton_sequence(i, 11) for i in range(start_idx, start_idx + n)]
+        )
+        v3 = np.array(
+            [self._halton_sequence(i, 13) for i in range(start_idx, start_idx + n)]
+        )
 
-        char_radius = W / (2 * np.sqrt(3))
-        max_rot_displacement = char_radius * np.pi
-        max_trans_displacement = V * np.sqrt(3) / 2
+        # --- MAPPING 1: ROTATIONS (Hopf Fibration) ---
+        # Maps u1, u2, u3 -> Unit Quaternion
+        sqrt_1_minus_u1 = np.sqrt(1 - u1)
+        sqrt_u1 = np.sqrt(u1)
 
-        grid_factor = min(1.0, 60 / self.n_grids)
-        coarseness = 32 / G
+        # Standard Hopf mapping
+        q0 = sqrt_1_minus_u1 * np.sin(2 * np.pi * u2)
+        q1 = sqrt_1_minus_u1 * np.cos(2 * np.pi * u2)
+        q2 = sqrt_u1 * np.sin(2 * np.pi * u3)
+        q3 = sqrt_u1 * np.cos(2 * np.pi * u3)
 
-        base_rot = 0.6
-        coarse_adjust = 0.15 * (coarseness - 1)
-        count_adjust = 0.1 * (1 - grid_factor)
+        self._quats = np.stack([q0, q1, q2, q3], axis=1).astype(np.float32)
 
-        w_rot = np.clip(base_rot - coarse_adjust + count_adjust, 0.3, 0.8)
-        w_trans = 1 - w_rot
+        # --- MAPPING 2: OFFSETS (Voxel Space) ---
+        # Maps v1, v2, v3 -> [0, voxel_size]^3
+        self._offsets = np.stack([v1, v2, v3], axis=1).astype(np.float32)
+        self._offsets *= self.voxel_size
 
-        print("SE(3) Sampler Auto-Tuning:")
-        print(f"  voxel_size: {V:.2f}")
-        print(f"  char_radius: {char_radius:.2f}")
-        print(f"  max_rot_displacement: {max_rot_displacement:.2f}")
-        print(f"  max_trans_displacement: {max_trans_displacement:.2f}")
-        print(f"  coarseness factor: {coarseness:.2f} (32/G)")
-        print(f"  grid count factor: {grid_factor:.2f}")
-        print(f"  → weights: rotation={w_rot:.2f}, translation={w_trans:.2f}")
+        # Convert quaternions to matrices
+        self._rotations = np.array([self._quat_to_matrix(q) for q in self._quats])
 
-        return w_rot, w_trans
+        return self._rotations, self._offsets
 
-    def quat_to_matrix(self, q):
+    def get_transforms(self, verbose=True):
+        # Wrapper to match your existing API
+        if verbose:
+            print(
+                f"  Generating {self.n_grids} deterministic SE(3) transforms (6D Halton)..."
+            )
+        return self.generate_deterministic()
+
+    def analyze_coverage(self):
+        """Check how well we covered the 6D space."""
+        if self._offsets is None:
+            return
+
+        # 1. Offset Coverage
+        diff = self._offsets[:, None, :] - self._offsets[None, :, :]
+        diff = diff - self.voxel_size * np.round(diff / self.voxel_size)
+        off_dists = np.linalg.norm(diff, axis=2)
+        np.fill_diagonal(off_dists, np.inf)
+        min_off = np.min(off_dists)
+
+        # 2. Rotation Coverage
+        # Quaternion distance: 2*arccos(|q1.q2|)
+        dot = np.abs(np.sum(self._quats[:, None, :] * self._quats[None, :, :], axis=2))
+        np.clip(dot, 0, 1, out=dot)
+        rot_dists = 2 * np.arccos(dot)
+        np.fill_diagonal(rot_dists, np.inf)
+        min_rot = np.min(rot_dists)
+
+        print("  Coverage Analysis (Deterministic):")
+        print(
+            f"    Min Offset Separation: {min_off:.4f} (Ideal random ~{self.voxel_size / self.n_grids**0.33:.2f})"
+        )
+        print(f"    Min Angular Separation: {np.degrees(min_rot):.1f}°")
+
+        # Simple check for 'bad' pairs (close in BOTH rotation AND translation)
+        # Normalize both to [0,1] roughly
+        combined_score = (off_dists / self.voxel_size) + (rot_dists / np.pi)
+        min_combined = np.min(combined_score)
+        print(f"    Min Combined Separation: {min_combined:.4f} (Higher is better)")
+
+    def _quat_to_matrix(self, q):
         w, x, y, z = q
         return np.array(
             [
-                [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-                [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-                [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+                [
+                    1 - 2 * y * y - 2 * z * z,
+                    2 * x * y - 2 * z * w,
+                    2 * x * z + 2 * y * w,
+                    0.0,
+                ],
+                [
+                    2 * x * y + 2 * z * w,
+                    1 - 2 * x * x - 2 * z * z,
+                    2 * y * z - 2 * x * w,
+                    0.0,
+                ],
+                [
+                    2 * x * z - 2 * y * w,
+                    2 * y * z + 2 * x * w,
+                    1 - 2 * x * x - 2 * y * y,
+                    0.0,
+                ],
+                [0.0, 0.0, 0.0, 1.0],
             ],
-            dtype="f4",
-        )
-
-    def config_distance(self, c1, c2):
-        q1, off1 = c1
-        q2, off2 = c2
-
-        dot = np.abs(np.dot(q1, q2))
-        rot_dist = 2 * np.arccos(np.clip(dot, 0, 1)) / np.pi
-
-        diff = off1 - off2
-        diff = diff - self.voxel_size * np.round(diff / self.voxel_size)
-        trans_dist = np.linalg.norm(diff) / (self.voxel_size * np.sqrt(3) / 2)
-
-        return self.w_rot * rot_dist + self.w_trans * trans_dist
-
-    def min_distance_to_set(self, config):
-        if len(self._configs) == 0:
-            return 1.0
-        return min(self.config_distance(config, c) for c in self._configs)
-
-    def get_icosahedral_quaternions(self):
-        phi = (1 + np.sqrt(5)) / 2
-        quats = []
-
-        for val in [1, -1]:
-            quats.append([val, 0, 0, 0])
-            quats.append([0, val, 0, 0])
-            quats.append([0, 0, val, 0])
-            quats.append([0, 0, 0, val])
-
-        for s0 in [1, -1]:
-            for s1 in [1, -1]:
-                for s2 in [1, -1]:
-                    for s3 in [1, -1]:
-                        quats.append([0.5 * s0, 0.5 * s1, 0.5 * s2, 0.5 * s3])
-
-        coords = [0, 1, phi, 1 / phi]
-        even_perms = [
-            (0, 1, 2, 3), (0, 2, 3, 1), (0, 3, 1, 2),
-            (1, 2, 0, 3), (1, 3, 2, 0), (1, 0, 3, 2),
-            (2, 0, 1, 3), (2, 3, 0, 1), (2, 1, 3, 0),
-            (3, 1, 0, 2), (3, 0, 2, 1), (3, 2, 1, 0),
-        ]
-
-        for perm in even_perms:
-            vals = [coords[perm[0]], coords[perm[1]], coords[perm[2]], coords[perm[3]]]
-            signs_list = [[1]]
-            for v in vals[1:]:
-                if v == 0:
-                    signs_list.append([1])
-                else:
-                    signs_list.append([1, -1])
-
-            for s1 in signs_list[1]:
-                for s2 in signs_list[2]:
-                    for s3 in signs_list[3]:
-                        q = [0.5 * vals[0], 0.5 * s1 * vals[1], 0.5 * s2 * vals[2], 0.5 * s3 * vals[3]]
-                        quats.append(q)
-
-        quats = [np.array(q, dtype="f4") for q in quats]
-        quats = [q / np.linalg.norm(q) for q in quats]
-
-        unique = []
-        for q in quats:
-            q = self._canonicalize_quat(q)
-            is_dup = any(np.abs(np.abs(np.dot(q, u)) - 1) < 1e-4 for u in unique)
-            if not is_dup:
-                unique.append(q)
-
-        print(f"  Generated {len(unique)} unique icosahedral rotations")
-        return unique[:60]
-
-    def _canonicalize_quat(self, q):
-        q = q / np.linalg.norm(q)
-        for i in range(4):
-            if abs(q[i]) > 1e-6:
-                return np.array(-q if q[i] < 0 else q, dtype="f4")
-        return np.array(q, dtype="f4")
-
-    def _random_config(self):
-        q = self.rng.standard_normal(4).astype("f4")
-        q = self._canonicalize_quat(q)
-        off = self.rng.uniform(0, self.voxel_size, 3).astype("f4")
-        return (q, off)
-
-    def _optimize_offset_for_rotation(self, q, n_candidates=200):
-        best_off = self.rng.uniform(0, self.voxel_size, 3).astype("f4")
-        best_dist = self.min_distance_to_set((q, best_off))
-
-        for _ in range(n_candidates):
-            off = self.rng.uniform(0, self.voxel_size, 3).astype("f4")
-            d = self.min_distance_to_set((q, off))
-            if d > best_dist:
-                best_dist = d
-                best_off = off
-
-        return best_off, best_dist
-
-    def get_transforms(self, n=None, verbose=False, optimize=True):
-        if n is None:
-            n = self.n_grids
-
-        already_cached = self._max_computed >= n
-
-        if optimize and not already_cached:
-            if verbose:
-                print("  Running energy optimization...")
-            self.optimize_energy(n_iterations=500, verbose=verbose)
-
-        rotations = np.zeros((n, 3, 3), dtype="f4")
-        offsets = np.zeros((n, 3), dtype="f4")
-
-        for i, (q, off) in enumerate(self._configs[:n]):
-            rotations[i] = self.quat_to_matrix(q)
-            offsets[i] = off
-
-        return rotations, offsets
-
-    def optimize_energy(self, n_iterations=500, verbose=True):
-        if len(self._configs) == 0:
-            return
-
-        n = len(self._configs)
-        quats = np.array([c[0] for c in self._configs])
-        offs = np.array([c[1] for c in self._configs])
-
-        lr_quat = 0.002
-        lr_off = 0.005 * self.voxel_size
-
-        best_energy = float("inf")
-        best_quats = quats.copy()
-        best_offs = offs.copy()
-
-        for iteration in range(n_iterations):
-            quat_grads = np.zeros_like(quats)
-            off_grads = np.zeros_like(offs)
-            total_energy = 0
-
-            for i in range(n):
-                for j in range(i + 1, n):
-                    dot = np.dot(quats[i], quats[j])
-                    sign = np.sign(dot) if dot != 0 else 1
-                    dot_abs = np.abs(dot)
-                    rot_dist = 2 * np.arccos(np.clip(dot_abs, 0, 0.9999))
-
-                    off_diff = offs[i] - offs[j]
-                    off_diff = off_diff - self.voxel_size * np.round(off_diff / self.voxel_size)
-                    trans_dist = np.linalg.norm(off_diff) + 1e-8
-
-                    dist = self.w_rot * rot_dist / np.pi + self.w_trans * trans_dist / (self.voxel_size * 0.866)
-                    dist = max(dist, 0.01)
-
-                    total_energy += 1.0 / dist
-                    force = 1.0 / (dist * dist)
-
-                    quat_diff = quats[i] - sign * quats[j]
-                    quat_diff_norm = np.linalg.norm(quat_diff) + 1e-8
-                    quat_grads[i] += force * quat_diff / quat_diff_norm
-                    quat_grads[j] -= force * sign * quat_diff / quat_diff_norm
-
-                    off_grads[i] += force * off_diff / trans_dist
-                    off_grads[j] -= force * off_diff / trans_dist
-
-            quats += lr_quat * quat_grads
-            offs += lr_off * off_grads
-
-            quats = quats / np.linalg.norm(quats, axis=1, keepdims=True)
-
-            for i in range(n):
-                for k in range(4):
-                    if abs(quats[i, k]) > 1e-6:
-                        if quats[i, k] < 0:
-                            quats[i] = -quats[i]
-                        break
-
-            offs = offs % self.voxel_size
-
-            if total_energy < best_energy:
-                best_energy = total_energy
-                best_quats = quats.copy()
-                best_offs = offs.copy()
-
-            lr_quat *= 0.998
-            lr_off *= 0.998
-
-            if verbose and (iteration + 1) % 100 == 0:
-                print(f"  Energy iter {iteration + 1}: energy={total_energy:.2f}, best={best_energy:.2f}")
-
-        self._configs = [(best_quats[i], best_offs[i]) for i in range(n)]
-        self._save_cache()
-
-        if verbose:
-            print(f"  Energy optimization complete. Best energy: {best_energy:.2f}")
-
-    def analyze_coverage(self, n=None):
-        if n is None:
-            n = len(self._configs)
-        configs = self._configs[:n]
-
-        dists = []
-        for i in range(n):
-            for j in range(i + 1, n):
-                dists.append(self.config_distance(configs[i], configs[j]))
-
-        dists = np.array(dists)
-
-        print(f"\nCoverage Analysis (n={n}):")
-        print(f"  Min pairwise distance: {dists.min():.4f}")
-        print(f"  Mean pairwise distance: {dists.mean():.4f}")
-        print(f"  Max pairwise distance: {dists.max():.4f}")
-        print(f"  Std pairwise distance: {dists.std():.4f}")
-
-        test_configs = [self._random_config() for _ in range(1000)]
-        max_gap = max(self.min_distance_to_set(c) for c in test_configs)
-        print(f"  Estimated covering radius: {max_gap:.4f}")
-
-        return dists
+            dtype=np.float32,
+        ).T[:3, :4]  # Return 3x4 matrix (padded)
 
 
 def set_uniform(prog, name, value):
@@ -415,11 +245,11 @@ class Simulation(mglw.WindowConfig):
         self.show_particles = True
 
         effective_res = self.grid_size * self.n_grids
-        total_cells = self.n_grids * (self.grid_size ** 3)
-        equiv_cells = effective_res ** 3
+        total_cells = self.n_grids * (self.grid_size**3)
+        equiv_cells = effective_res**3
 
         solver_mode = "Direct Convolution" if self.use_convolution else "FFT"
-        print(f"Linear-Sparse-Grid Config (3D):")
+        print("Linear-Sparse-Grid Config (3D):")
         print(f"  Solver: {solver_mode}")
         print(f"  world_size: {self.world_size}")
         print(f"  num_particles: {self.num_particles:,}")
@@ -433,14 +263,13 @@ class Simulation(mglw.WindowConfig):
         offsets = np.zeros((self.n_grids, 4), dtype="f4")
         rotations = np.zeros((self.n_grids, 12), dtype="f4")
 
-        sampler = HierarchicalSE3Sampler(
+        sampler = FastSE3Sampler(
             grid_size=self.grid_size,
             world_size=self.world_size,
             n_grids=self.n_grids,
             seed=12345,
         )
         rot_mats, offs = sampler.get_transforms(verbose=True)
-        sampler.analyze_coverage()
 
         for i in range(self.n_grids):
             offsets[i, 0:3] = offs[i]
@@ -473,7 +302,7 @@ class Simulation(mglw.WindowConfig):
         self.offset_buf = self.ctx.buffer(self.offsets.tobytes())
         self.rotation_buf = self.ctx.buffer(self.rotations.tobytes())
 
-        cells_per_grid = self.grid_size ** 3
+        cells_per_grid = self.grid_size**3
         total_cells = self.n_grids * cells_per_grid
         self.mass_buf = self.ctx.buffer(reserve=total_cells * 4)
 
@@ -527,7 +356,8 @@ class Simulation(mglw.WindowConfig):
         gs = self.grid_size
         voxel = self.voxel_size
 
-        kernel = np.zeros((gs, gs, gs, 3), dtype="f4")
+        # Pack as vec4 for better GPU memory alignment (16-byte aligned reads)
+        kernel = np.zeros((gs, gs, gs, 4), dtype="f4")
 
         for iz in range(gs):
             for iy in range(gs):
@@ -548,8 +378,9 @@ class Simulation(mglw.WindowConfig):
                         kernel[iz, iy, ix, 0] = rx * factor
                         kernel[iz, iy, ix, 1] = ry * factor
                         kernel[iz, iy, ix, 2] = rz * factor
+                        # kernel[iz, iy, ix, 3] = 0 (padding)
 
-        print(f"Green's kernel (3D): {gs}x{gs}x{gs}x3, voxel={voxel:.2f}")
+        print(f"Green's kernel (3D): {gs}x{gs}x{gs}x4, voxel={voxel:.2f}")
 
         self.green_kernel_buf = self.ctx.buffer(kernel.tobytes())
         print(f"  Kernel buffer size: {kernel.nbytes / 1024:.1f} KB")
@@ -557,7 +388,9 @@ class Simulation(mglw.WindowConfig):
     def init_particles(self):
         self.init_particles_gpu(noise_scale=4.0, density_contrast=2.0, seed=None)
 
-    def init_particles_gpu(self, noise_scale=4.0, density_contrast=2.0, seed=None, spawn_buffer=None):
+    def init_particles_gpu(
+        self, noise_scale=4.0, density_contrast=2.0, seed=None, spawn_buffer=None
+    ):
         if seed is None:
             seed = np.random.randint(0, 2**31)
         if spawn_buffer is None:
@@ -579,7 +412,9 @@ class Simulation(mglw.WindowConfig):
         self.prog_init_particles.run((n_particles + 255) // 256)
         self.ctx.memory_barrier()
 
-        print(f"GPU init: {n_particles:,} particles, scale={noise_scale}, contrast={density_contrast}, buffer={spawn_buffer:.0%}")
+        print(
+            f"GPU init: {n_particles:,} particles, scale={noise_scale}, contrast={density_contrast}, buffer={spawn_buffer:.0%}"
+        )
 
     def init_particles2(self):
         """Initialize two colliding galaxies."""
@@ -589,10 +424,12 @@ class Simulation(mglw.WindowConfig):
         center = self.world_size / 2.0
         n_per_galaxy = self.num_particles // 2
 
-        for i, (offset, v_bulk) in enumerate([
-            (np.array([-0.2, 0.0, 0.0]), np.array([0.3, 0.1, 0.0])),
-            (np.array([0.2, 0.0, 0.0]), np.array([-0.3, -0.1, 0.0])),
-        ]):
+        for i, (offset, v_bulk) in enumerate(
+            [
+                (np.array([-0.2, 0.0, 0.0]), np.array([0.3, 0.1, 0.0])),
+                (np.array([0.2, 0.0, 0.0]), np.array([-0.3, -0.1, 0.0])),
+            ]
+        ):
             start = i * n_per_galaxy
             end = start + n_per_galaxy
 
@@ -609,7 +446,9 @@ class Simulation(mglw.WindowConfig):
             pos[start:end, 2] = center + offset[2] * self.world_size + z
             pos[start:end, 3] = self.cfg["particle_mass"]
 
-            spin_axis = np.array([0.3, 0.7, 0.5]) if i == 0 else np.array([-0.5, 0.2, 0.8])
+            spin_axis = (
+                np.array([0.3, 0.7, 0.5]) if i == 0 else np.array([-0.5, 0.2, 0.8])
+            )
             spin_axis = spin_axis / np.linalg.norm(spin_axis)
 
             v_circ = 0.3 * np.sqrt(r / self.world_size + 0.01)
@@ -651,7 +490,9 @@ class Simulation(mglw.WindowConfig):
                 """,
         )
         self.render_prog["world_size"] = self.world_size
-        self.vao = self.ctx.vertex_array(self.render_prog, [(self.pos_buf, "4f", "in_pos")])
+        self.vao = self.ctx.vertex_array(
+            self.render_prog, [(self.pos_buf, "4f", "in_pos")]
+        )
 
         self.grid_debug_prog = self.ctx.program(
             vertex_shader="""
@@ -689,11 +530,16 @@ class Simulation(mglw.WindowConfig):
             f = h * 6 - i
             p, q, t = v * (1 - s), v * (1 - f * s), v * (1 - (1 - f) * s)
             i = i % 6
-            if i == 0: return (v, t, p)
-            if i == 1: return (q, v, p)
-            if i == 2: return (p, v, t)
-            if i == 3: return (p, q, v)
-            if i == 4: return (t, p, v)
+            if i == 0:
+                return (v, t, p)
+            if i == 1:
+                return (q, v, p)
+            if i == 2:
+                return (p, v, t)
+            if i == 3:
+                return (p, q, v)
+            if i == 4:
+                return (t, p, v)
             return (v, p, q)
 
         vs = self.voxel_size
@@ -713,29 +559,37 @@ class Simulation(mglw.WindowConfig):
             offset = self.offsets[grid_idx][:3]
             rot_data = self.rotations[grid_idx]
 
-            rot = np.array([
-                [rot_data[0], rot_data[4], rot_data[8]],
-                [rot_data[1], rot_data[5], rot_data[9]],
-                [rot_data[2], rot_data[6], rot_data[10]],
-            ], dtype="f4")
+            rot = np.array(
+                [
+                    [rot_data[0], rot_data[4], rot_data[8]],
+                    [rot_data[1], rot_data[5], rot_data[9]],
+                    [rot_data[2], rot_data[6], rot_data[10]],
+                ],
+                dtype="f4",
+            )
 
-            world_offset = np.array([center + offset[0], center + offset[1], center + offset[2]], dtype="f4")
+            world_offset = np.array(
+                [center + offset[0], center + offset[1], center + offset[2]], dtype="f4"
+            )
 
             for cx in range(-half_extent, half_extent + 1):
                 for cy in range(-half_extent, half_extent + 1):
                     for cz in range(-half_extent, half_extent + 1):
                         cell_origin = np.array([cx * vs, cy * vs, cz * vs], dtype="f4")
 
-                        corners = np.array([
-                            cell_origin + [0, 0, 0],
-                            cell_origin + [vs, 0, 0],
-                            cell_origin + [0, vs, 0],
-                            cell_origin + [vs, vs, 0],
-                            cell_origin + [0, 0, vs],
-                            cell_origin + [vs, 0, vs],
-                            cell_origin + [0, vs, vs],
-                            cell_origin + [vs, vs, vs],
-                        ], dtype="f4")
+                        corners = np.array(
+                            [
+                                cell_origin + [0, 0, 0],
+                                cell_origin + [vs, 0, 0],
+                                cell_origin + [0, vs, 0],
+                                cell_origin + [vs, vs, 0],
+                                cell_origin + [0, 0, vs],
+                                cell_origin + [vs, 0, vs],
+                                cell_origin + [0, vs, vs],
+                                cell_origin + [vs, vs, vs],
+                            ],
+                            dtype="f4",
+                        )
 
                         rotated_corners = []
                         for c in corners:
@@ -743,16 +597,32 @@ class Simulation(mglw.WindowConfig):
                             world = rotated + world_offset
                             rotated_corners.append(world)
 
-                        edges = [(0, 1), (0, 2), (0, 4), (1, 3), (1, 5), (2, 3),
-                                 (2, 6), (3, 7), (4, 5), (4, 6), (5, 7), (6, 7)]
+                        edges = [
+                            (0, 1),
+                            (0, 2),
+                            (0, 4),
+                            (1, 3),
+                            (1, 5),
+                            (2, 3),
+                            (2, 6),
+                            (3, 7),
+                            (4, 5),
+                            (4, 6),
+                            (5, 7),
+                            (6, 7),
+                        ]
                         for i, j in edges:
-                            positions.extend([list(rotated_corners[i]), list(rotated_corners[j])])
+                            positions.extend(
+                                [list(rotated_corners[i]), list(rotated_corners[j])]
+                            )
                         colors.extend([color] * 24)
 
         positions = np.array(positions, dtype="f4")
         colors = np.array(colors, dtype="f4")
 
-        print(f"Grid debug: {len(positions)} vertices for {n_to_draw} grids × {cells_per_axis}^3 cells")
+        print(
+            f"Grid debug: {len(positions)} vertices for {n_to_draw} grids × {cells_per_axis}^3 cells"
+        )
 
         pos_buf = self.ctx.buffer(positions.tobytes())
         color_buf = self.ctx.buffer(colors.tobytes())
@@ -763,7 +633,7 @@ class Simulation(mglw.WindowConfig):
         self.grid_debug_bufs = [pos_buf, color_buf]
 
     def clear_mass(self):
-        cells_per_grid = self.grid_size ** 3
+        cells_per_grid = self.grid_size**3
         total_cells = self.n_grids * cells_per_grid
         zeros = np.zeros(total_cells, dtype="u4")
         self.mass_buf.write(zeros.tobytes())
@@ -822,7 +692,9 @@ class Simulation(mglw.WindowConfig):
         self.prog_complex.run(*dispatch)
         self.ctx.memory_barrier()
 
-        spectrum_tex = self.run_fft_3d_batched(self.complex_tex_a, self.complex_tex_b, forward=True)
+        spectrum_tex = self.run_fft_3d_batched(
+            self.complex_tex_a, self.complex_tex_b, forward=True
+        )
 
         spectrum_tex.bind_to_image(0, read=True, write=True)
         set_uniform(self.prog_fourier, "gridSize", gs)
@@ -841,9 +713,15 @@ class Simulation(mglw.WindowConfig):
         self.prog_greens.run(*dispatch)
         self.ctx.memory_barrier()
 
-        real_x = self.run_fft_3d_batched(self.grad_comp_x, self.complex_tex_b, forward=False)
-        real_y = self.run_fft_3d_batched(self.grad_comp_y, self.complex_tex_a, forward=False)
-        real_z = self.run_fft_3d_batched(self.grad_comp_z, self.complex_tex_b, forward=False)
+        real_x = self.run_fft_3d_batched(
+            self.grad_comp_x, self.complex_tex_b, forward=False
+        )
+        real_y = self.run_fft_3d_batched(
+            self.grad_comp_y, self.complex_tex_a, forward=False
+        )
+        real_z = self.run_fft_3d_batched(
+            self.grad_comp_z, self.complex_tex_b, forward=False
+        )
 
         real_x.bind_to_image(0, read=True, write=False)
         real_y.bind_to_image(1, read=True, write=False)
