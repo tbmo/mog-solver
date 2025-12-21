@@ -16,22 +16,129 @@ import moderngl_window as mglw
 from pathlib import Path
 import yaml
 
+import pickle
+import hashlib
 
-class HierarchicalSO3Sampler:
+
+class HierarchicalSE3Sampler:
     """
-    Generates rotations that hierarchically subdivide SO(3).
+    Jointly optimizes rotation + translation for grid sampling.
 
-    Each new rotation is placed to maximally fill gaps left by previous ones,
-    so rotations 0..n are always an optimal-ish covering for that count.
-
-    Uses quaternions on S³ (double cover of SO(3)).
+    The configuration space is SO(3) × T³ where T³ is the 3-torus of
+    translations mod voxel_size. We want each (rotation, offset) pair
+    to create a maximally different grid tessellation of space.
     """
 
-    def __init__(self, seed=42):
+    def __init__(self, grid_size, world_size, n_grids, seed=42, cache_dir=".se3_cache"):
+        self.grid_size = grid_size
+        self.world_size = world_size
+        self.voxel_size = world_size / grid_size
+        self.n_grids = n_grids
+        self.seed = seed
         self.rng = np.random.default_rng(seed)
-        # Cache of computed quaternions for hierarchical access
-        self._quaternions = []
+        self._configs = []
         self._max_computed = 0
+
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(exist_ok=True)
+        self.cache_key = self._compute_cache_key()
+        self.cache_path = self.cache_dir / f"{self.cache_key}.pkl"
+
+        if self._load_cache():
+            print(f"  Loaded {len(self._configs)} configs from cache")
+
+        self.w_rot, self.w_trans = self._compute_weights()
+
+    def _compute_cache_key(self):
+        """Generate a unique hash for these parameters."""
+        params = f"gs{self.grid_size}_ws{self.world_size}_ng{self.n_grids}_s{self.seed}"
+        return hashlib.md5(params.encode()).hexdigest()[:12]
+
+    def _load_cache(self):
+        """Try to load configs from cache file."""
+        if self.cache_path.exists():
+            try:
+                with open(self.cache_path, "rb") as f:
+                    data = pickle.load(f)
+                    self._configs = data["configs"]
+                    self._max_computed = data["max_computed"]
+                    return True
+            except Exception as e:
+                print(f"  Cache load failed: {e}")
+        return False
+
+    def _save_cache(self):
+        """Save current configs to cache file."""
+        try:
+            with open(self.cache_path, "wb") as f:
+                pickle.dump(
+                    {
+                        "configs": self._configs,
+                        "max_computed": self._max_computed,
+                        "params": {
+                            "grid_size": self.grid_size,
+                            "world_size": self.world_size,
+                            "n_grids": self.n_grids,
+                            "seed": self.seed,
+                        },
+                    },
+                    f,
+                )
+            print(f"  Saved {len(self._configs)} configs to cache")
+        except Exception as e:
+            print(f"  Cache save failed: {e}")
+
+    def _compute_weights(self):
+        """
+        Auto-tune rotation vs translation weights.
+
+        Key insight: A rotation of angle θ moves points at distance r by ~rθ.
+        A translation moves all points equally.
+
+        For a grid of size G in world of size W:
+        - Typical point distance from grid origin: ~W/2
+        - Voxel size: V = W/G
+        - Max useful rotation effect: ~(W/2) × π = πW/2
+        - Max useful translation effect: V × √3/2 (diagonal of voxel)
+
+        We want both to contribute comparably to cell boundary movement.
+        """
+        V = self.voxel_size
+        W = self.world_size
+        G = self.grid_size
+
+        char_radius = W / (2 * np.sqrt(3))
+
+        max_rot_displacement = char_radius * np.pi
+
+        max_trans_displacement = V * np.sqrt(3) / 2
+
+        ratio = max_trans_displacement / max_rot_displacement
+
+        grid_factor = min(1.0, 60 / self.n_grids)
+
+        coarseness = 32 / G
+
+        base_rot = 0.6
+        base_trans = 0.4
+
+        coarse_adjust = 0.15 * (coarseness - 1)
+
+        count_adjust = 0.1 * (1 - grid_factor)
+
+        w_rot = np.clip(base_rot - coarse_adjust + count_adjust, 0.3, 0.8)
+        w_trans = 1 - w_rot
+
+        print(f"SE(3) Sampler Auto-Tuning:")
+        print(f"  voxel_size: {V:.2f}")
+        print(f"  char_radius: {char_radius:.2f}")
+        print(f"  max_rot_displacement: {max_rot_displacement:.2f}")
+        print(f"  max_trans_displacement: {max_trans_displacement:.2f}")
+        print(f"  coarseness factor: {coarseness:.2f} (32/G)")
+        print(f"  grid count factor: {grid_factor:.2f}")
+        print(f"  → weights: rotation={w_rot:.2f}, translation={w_trans:.2f}")
+
+        return w_rot, w_trans
 
     def quat_to_matrix(self, q):
         """Convert unit quaternion [w,x,y,z] to 3x3 rotation matrix."""
@@ -45,186 +152,244 @@ class HierarchicalSO3Sampler:
             dtype="f4",
         )
 
-    def geodesic_distance(self, q1, q2):
+    def config_distance(self, c1, c2):
         """
-        Geodesic distance on SO(3) between two quaternions.
-        Returns angle in radians [0, π].
+        Distance between two (rotation, offset) configurations.
+        Uses auto-tuned weights for rotation vs translation.
         """
-        # q and -q represent same rotation, take the closer one
-        dot = np.abs(np.dot(q1, q2))
-        return 2 * np.arccos(np.clip(dot, 0, 1))
+        q1, off1 = c1
+        q2, off2 = c2
 
-    def min_distance_to_set(self, q, quats):
-        """Minimum geodesic distance from q to any quaternion in quats."""
-        if len(quats) == 0:
-            return np.pi  # max possible
-        dots = np.abs(np.array([np.dot(q, qi) for qi in quats]))
-        return 2 * np.arccos(np.clip(np.max(dots), 0, 1))
+        dot = np.abs(np.dot(q1, q2))
+        rot_dist = 2 * np.arccos(np.clip(dot, 0, 1)) / np.pi
+
+        diff = off1 - off2
+        diff = diff - self.voxel_size * np.round(diff / self.voxel_size)
+        trans_dist = np.linalg.norm(diff) / (self.voxel_size * np.sqrt(3) / 2)
+
+        return self.w_rot * rot_dist + self.w_trans * trans_dist
+
+    def min_distance_to_set(self, config):
+        """Minimum distance from config to all existing configurations."""
+        if len(self._configs) == 0:
+            return 1.0
+        return min(self.config_distance(config, c) for c in self._configs)
 
     def get_icosahedral_quaternions(self):
         """
-        The 120 unit quaternions forming the binary icosahedral group.
-        These are vertices of the 600-cell and give the 60 icosahedral
-        rotations (pairs ±q give same rotation).
+        Generate all 60 icosahedral rotation quaternions.
+        Uses the binary icosahedral group (120 quaternions on S³),
+        then takes one representative from each ±q pair.
         """
         phi = (1 + np.sqrt(5)) / 2
         quats = []
 
-        # 8 quaternions: (±1, 0, 0, 0) and permutations - half of 16-cell
-        for i in range(4):
-            q = [0, 0, 0, 0]
-            q[i] = 1
-            quats.append(q)
+        for val in [1, -1]:
+            quats.append([val, 0, 0, 0])
+            quats.append([0, val, 0, 0])
+            quats.append([0, 0, val, 0])
+            quats.append([0, 0, 0, val])
 
-        # 16 quaternions: ½(±1, ±1, ±1, ±1) - half of 8-cell
-        for signs in [
-            (1, 1, 1, 1),
-            (1, 1, -1, -1),
-            (1, -1, 1, -1),
-            (1, -1, -1, 1),
-            (-1, 1, 1, -1),
-            (-1, 1, -1, 1),
-            (-1, -1, 1, 1),
-            (-1, -1, -1, -1),
-        ]:
-            quats.append([0.5 * s for s in signs])
+        for s0 in [1, -1]:
+            for s1 in [1, -1]:
+                for s2 in [1, -1]:
+                    for s3 in [1, -1]:
+                        quats.append([0.5 * s0, 0.5 * s1, 0.5 * s2, 0.5 * s3])
 
-        # 96 quaternions from even permutations of ½(0, ±1, ±1/φ, ±φ)
-        coords = [0, 1, 1 / phi, phi]
-        # Generate even permutations
+        coords = [0, 1, phi, 1 / phi]
+
         even_perms = [
             (0, 1, 2, 3),
             (0, 2, 3, 1),
             (0, 3, 1, 2),
-            (1, 0, 3, 2),
             (1, 2, 0, 3),
             (1, 3, 2, 0),
+            (1, 0, 3, 2),
             (2, 0, 1, 3),
-            (2, 1, 3, 0),
             (2, 3, 0, 1),
-            (3, 0, 2, 1),
+            (2, 1, 3, 0),
             (3, 1, 0, 2),
+            (3, 0, 2, 1),
             (3, 2, 1, 0),
         ]
 
         for perm in even_perms:
-            base = [coords[perm[0]], coords[perm[1]], coords[perm[2]], coords[perm[3]]]
-            # All sign combinations where first nonzero is positive (to get half)
-            for s1 in [1] if base[1] == 0 else [1, -1]:
-                for s2 in [1] if base[2] == 0 else [1, -1]:
-                    for s3 in [1] if base[3] == 0 else [1, -1]:
+            vals = [coords[perm[0]], coords[perm[1]], coords[perm[2]], coords[perm[3]]]
+            signs_list = [[1]]
+            for v in vals[1:]:
+                if v == 0:
+                    signs_list.append([1])
+                else:
+                    signs_list.append([1, -1])
+
+            for s1 in signs_list[1]:
+                for s2 in signs_list[2]:
+                    for s3 in signs_list[3]:
                         q = [
-                            0.5 * base[0],
-                            0.5 * s1 * base[1],
-                            0.5 * s2 * base[2],
-                            0.5 * s3 * base[3],
+                            0.5 * vals[0],
+                            0.5 * s1 * vals[1],
+                            0.5 * s2 * vals[2],
+                            0.5 * s3 * vals[3],
                         ]
                         quats.append(q)
 
-        # Normalize and deduplicate
-        quats = np.array(quats, dtype="f4")
-        quats = quats / np.linalg.norm(quats, axis=1, keepdims=True)
+        quats = [np.array(q, dtype="f4") for q in quats]
+        quats = [q / np.linalg.norm(q) for q in quats]
 
-        # Remove duplicates and keep only one of each ±q pair
         unique = []
         for q in quats:
-            is_dup = False
-            for uq in unique:
-                if np.abs(np.abs(np.dot(q, uq)) - 1) < 1e-6:
-                    is_dup = True
-                    break
+            q = self._canonicalize_quat(q)
+            is_dup = any(np.abs(np.abs(np.dot(q, u)) - 1) < 1e-4 for u in unique)
             if not is_dup:
-                # Canonicalize: ensure w > 0 (or if w=0, x > 0, etc.)
-                for i in range(4):
-                    if abs(q[i]) > 1e-6:
-                        if q[i] < 0:
-                            q = -q
-                        break
                 unique.append(q)
 
-        return np.array(unique[:60], dtype="f4")  # Should be exactly 60
+        print(f"  Generated {len(unique)} unique icosahedral rotations")
+        return unique[:60]
 
-    def compute_hierarchical(self, n):
+    def _canonicalize_quat(self, q):
+        """Ensure quaternion is in positive hemisphere."""
+        q = q / np.linalg.norm(q)
+        for i in range(4):
+            if abs(q[i]) > 1e-6:
+                return np.array(-q if q[i] < 0 else q, dtype="f4")
+        return np.array(q, dtype="f4")
+
+    def _random_config(self):
+        """Generate random (quaternion, offset) configuration."""
+        q = self.rng.standard_normal(4).astype("f4")
+        q = self._canonicalize_quat(q)
+        off = self.rng.uniform(0, self.voxel_size, 3).astype("f4")
+        return (q, off)
+
+    def _optimize_offset_for_rotation(self, q, n_candidates=200):
+        """Find best offset for a given rotation quaternion."""
+        best_off = self.rng.uniform(0, self.voxel_size, 3).astype("f4")
+        best_dist = self.min_distance_to_set((q, best_off))
+
+        for _ in range(n_candidates):
+            off = self.rng.uniform(0, self.voxel_size, 3).astype("f4")
+            d = self.min_distance_to_set((q, off))
+            if d > best_dist:
+                best_dist = d
+                best_off = off
+
+        return best_off, best_dist
+
+    def compute_hierarchical(self, n, verbose=False):
         """
-        Compute n quaternions where each successive one maximally
-        subdivides the space covered by previous ones.
+        Compute n (rotation, offset) configurations hierarchically.
+
+        Strategy:
+        1. First 60: icosahedral rotations with optimized offsets
+        2. 61-120: same rotations, new optimized offsets (subdivides!)
+        3. Beyond: full SE(3) farthest-point sampling
         """
         if n <= self._max_computed:
-            return self._quaternions[:n]
+            return self._configs[:n]
 
-        # Start with icosahedral if we have room
-        if self._max_computed == 0:
-            icosa = self.get_icosahedral_quaternions()
-            if n <= 60:
-                self._quaternions = list(icosa[:n])
-            else:
-                self._quaternions = list(icosa)
-            self._max_computed = len(self._quaternions)
+        icosa_quats = self.get_icosahedral_quaternions()
 
-        # For remaining slots, use greedy farthest-point sampling
-        # Generate candidate pool
-        n_candidates = max(1000, n * 20)
-        candidates = self._random_quaternions(n_candidates)
+        while self._max_computed < min(n, len(icosa_quats) * 4):
+            cycle = self._max_computed // 60
+            idx = self._max_computed % 60
 
-        while self._max_computed < n:
-            # Find candidate farthest from all existing
-            best_dist = -1
-            best_q = None
+            q = icosa_quats[idx]
+            off, dist = self._optimize_offset_for_rotation(
+                q, n_candidates=150 + cycle * 50
+            )
 
-            for q in candidates:
-                d = self.min_distance_to_set(q, self._quaternions)
-                if d > best_dist:
-                    best_dist = d
-                    best_q = q
-
-            self._quaternions.append(best_q)
+            self._configs.append((q, off))
             self._max_computed += 1
 
-            # Remove nearby candidates to speed up search
-            candidates = [
-                q
-                for q in candidates
-                if self.geodesic_distance(q, best_q) > best_dist * 0.3
-            ]
+            if verbose and self._max_computed % 20 == 0:
+                print(
+                    f"  Config {self._max_computed}: cycle={cycle}, min_dist={dist:.4f}"
+                )
 
-            # Replenish if running low
-            if len(candidates) < n * 5:
-                candidates.extend(self._random_quaternions(500))
+        if n > self._max_computed:
+            n_candidates = max(500, (n - self._max_computed) * 10)
+            candidates = [self._random_config() for _ in range(n_candidates)]
 
-        return self._quaternions[:n]
+            while self._max_computed < n:
+                best_dist = -1
+                best_config = None
+                best_idx = -1
 
-    def _random_quaternions(self, n):
-        """Generate n uniformly random unit quaternions."""
-        # Gaussian in 4D, then normalize = uniform on S³
-        q = self.rng.standard_normal((n, 4)).astype("f4")
-        q = q / np.linalg.norm(q, axis=1, keepdims=True)
-        # Canonicalize to positive hemisphere
+                for i, config in enumerate(candidates):
+                    d = self.min_distance_to_set(config)
+                    if d > best_dist:
+                        best_dist = d
+                        best_config = config
+                        best_idx = i
+
+                self._configs.append(best_config)
+                self._max_computed += 1
+
+                if verbose and self._max_computed % 20 == 0:
+                    print(
+                        f"  Config {self._max_computed}: full SE(3), min_dist={best_dist:.4f}"
+                    )
+
+                candidates.pop(best_idx)
+                candidates = [
+                    c
+                    for c in candidates
+                    if self.config_distance(c, best_config) > best_dist * 0.3
+                ]
+
+                if len(candidates) < (n - self._max_computed) * 3:
+                    candidates.extend([self._random_config() for _ in range(300)])
+
+        self._save_cache()
+
+        return self._configs[:n]
+
+    def get_transforms(self, n=None, verbose=False):
+        """
+        Get (rotation_matrix, offset) pairs for grid transforms.
+
+        Returns:
+            rotations: (n, 3, 3) array of rotation matrices
+            offsets: (n, 3) array of translation offsets
+        """
+        if n is None:
+            n = self.n_grids
+
+        configs = self.compute_hierarchical(n, verbose)
+
+        rotations = np.zeros((n, 3, 3), dtype="f4")
+        offsets = np.zeros((n, 3), dtype="f4")
+
+        for i, (q, off) in enumerate(configs):
+            rotations[i] = self.quat_to_matrix(q)
+            offsets[i] = off
+
+        return rotations, offsets
+
+    def analyze_coverage(self, n=None):
+        """Analyze the quality of the configuration set."""
+        if n is None:
+            n = len(self._configs)
+        configs = self._configs[:n]
+
+        dists = []
         for i in range(n):
-            for j in range(4):
-                if abs(q[i, j]) > 1e-6:
-                    if q[i, j] < 0:
-                        q[i] = -q[i]
-                    break
-        return list(q)
+            for j in range(i + 1, n):
+                dists.append(self.config_distance(configs[i], configs[j]))
 
-    def get_rotations(self, n):
-        """Get n hierarchically-placed rotation matrices."""
-        quats = self.compute_hierarchical(n)
-        return [self.quat_to_matrix(q) for q in quats]
+        dists = np.array(dists)
 
-    def get_covering_radius(self, n):
-        """
-        Compute the covering radius: max distance from any point in SO(3)
-        to the nearest rotation in our set. Smaller = better coverage.
-        """
-        quats = self.compute_hierarchical(n)
-        # Sample random points and find max min-distance
-        test_points = self._random_quaternions(10000)
-        max_min_dist = 0
-        for q in test_points:
-            d = self.min_distance_to_set(q, quats)
-            max_min_dist = max(max_min_dist, d)
-        return max_min_dist
+        print(f"\nCoverage Analysis (n={n}):")
+        print(f"  Min pairwise distance: {dists.min():.4f}")
+        print(f"  Mean pairwise distance: {dists.mean():.4f}")
+        print(f"  Max pairwise distance: {dists.max():.4f}")
+        print(f"  Std pairwise distance: {dists.std():.4f}")
+
+        test_configs = [self._random_config() for _ in range(1000)]
+        max_gap = max(self.min_distance_to_set(c) for c in test_configs)
+        print(f"  Estimated covering radius: {max_gap:.4f}")
+
+        return dists
 
 
 def set_uniform(prog, name, value):
@@ -282,7 +447,6 @@ class Simulation(mglw.WindowConfig):
         self.timescale = 1.0
         self.paused = False
 
-        # Linear-Sparse-Grid parameters
         self.n_grids = int(self.cfg.get("n_grids", 16))
         self.grid_size = int(self.cfg["grid_size"])
         self.world_size = float(self.cfg["world_size"])
@@ -291,7 +455,6 @@ class Simulation(mglw.WindowConfig):
         self.G = self.cfg["G"]
         self.dt = self.cfg["dt"]
 
-        # Precompute diagonal offsets
         self.offsets, self.rotations = self.compute_transforms()
 
         self.init_buffers()
@@ -300,7 +463,6 @@ class Simulation(mglw.WindowConfig):
         self.init_particles()
         self.init_render()
 
-        # Camera State
         self.cam_rot_x = 0.0
         self.cam_rot_y = 0.0
         self.cam_dist = 3.0
@@ -313,7 +475,6 @@ class Simulation(mglw.WindowConfig):
 
         print(f"Linear-Sparse-Grid Config ({self.dim}D):")
         print(f"  world_size: {self.world_size}")
-        # particle count
         print(f"  num_particles: {self.num_particles:,}")
         print(f"  n_grids: {self.n_grids}")
         print(f"  grid_size: {self.grid_size}^{self.dim}")
@@ -328,9 +489,8 @@ class Simulation(mglw.WindowConfig):
         Returns all 60 proper rotations of an icosahedron.
         """
         rotations = []
-        phi = (1 + np.sqrt(5)) / 2  # golden ratio
+        phi = (1 + np.sqrt(5)) / 2
 
-        # The 12 vertices of an icosahedron (normalized)
         icosa_verts = np.array(
             [
                 [0, 1, phi],
@@ -370,16 +530,13 @@ class Simulation(mglw.WindowConfig):
                 seen.add(key)
                 rotations.append(mat.astype("f4"))
 
-        # Identity
         add_rotation(np.eye(3))
 
-        # 5-fold axes through vertices: 72°, 144°, 216°, 288°
         for v in icosa_verts:
             for k in [1, 2, 3, 4]:
                 angle = k * 2 * np.pi / 5
                 add_rotation(rotation_matrix(v, angle))
 
-        # 3-fold axes through face centers: 120°, 240°
         faces = [
             (0, 2, 8),
             (0, 8, 4),
@@ -409,7 +566,6 @@ class Simulation(mglw.WindowConfig):
                 angle = k * 2 * np.pi / 3
                 add_rotation(rotation_matrix(center, angle))
 
-        # 2-fold axes through edge midpoints: 180°
         edges = set()
         for f in faces:
             edges.add((min(f[0], f[1]), max(f[0], f[1])))
@@ -423,7 +579,6 @@ class Simulation(mglw.WindowConfig):
 
         print(f"Generated {len(rotations)} icosahedral rotations")
 
-        # Should be exactly 60
         assert len(rotations) == 60, f"Expected 60 rotations, got {len(rotations)}"
 
         return rotations
@@ -432,15 +587,12 @@ class Simulation(mglw.WindowConfig):
         """Returns all 8 rotations/reflections of a square as 2x2 matrices (D4 group)."""
         rotations = []
 
-        # 4 rotations (0, 90, 180, 270 degrees)
         for k in range(4):
             angle = k * np.pi / 2
             c, s = np.cos(angle), np.sin(angle)
             rot = np.array([[c, -s], [s, c]], dtype="f4")
             rotations.append(rot)
 
-        # 4 reflections (across x, y, and two diagonals)
-        # Reflection across x-axis then rotate
         reflect = np.array([[1, 0], [0, -1]], dtype="f4")
         for k in range(4):
             angle = k * np.pi / 2
@@ -450,58 +602,36 @@ class Simulation(mglw.WindowConfig):
 
         return rotations
 
-    # Integration with your Simulation class:
     def compute_transforms(self):
-        """Updated compute_transforms using hierarchical SO(3) sampling."""
         offsets = np.zeros((self.n_grids, 4), dtype="f4")
         rotations = np.zeros((self.n_grids, 12), dtype="f4")
 
         if self.dim == 2:
-            # Keep original 2D logic
             dihedral = self.get_dihedral_rotations()
             diag_dirs = np.array(
                 [[1, 1], [1, -1], [-1, 1], [-1, -1]], dtype="f4"
             ) / np.sqrt(2)
-
             for i in range(self.n_grids):
                 frac = i / self.n_grids
                 offsets[i, 0:2] = frac * self.voxel_size * diag_dirs[i % 4]
                 rot = dihedral[i % 8]
                 rotations[i, 0:2] = rot[:, 0]
                 rotations[i, 4:6] = rot[:, 1]
+        else:
+            sampler = HierarchicalSE3Sampler(
+                grid_size=self.grid_size,
+                world_size=self.world_size,
+                n_grids=self.n_grids,
+                seed=12345,
+            )
+            rot_mats, offs = sampler.get_transforms(verbose=True)
+            sampler.analyze_coverage()
 
-        else:  # 3D - use hierarchical SO(3) sampling
-            sampler = HierarchicalSO3Sampler(seed=12345)
-            rot_matrices = sampler.get_rotations(self.n_grids)
-
-            # For offsets, use the rotation axes as offset directions
-            # This couples offset direction to rotation, maximizing coverage diversity
             for i in range(self.n_grids):
-                frac = i / self.n_grids
-                rot = rot_matrices[i]
-
-                # Extract axis from rotation matrix via quaternion
-                # The offset direction could also be independent - see alternative below
-                trace = rot[0, 0] + rot[1, 1] + rot[2, 2]
-                angle = np.arccos(np.clip((trace - 1) / 2, -1, 1))
-
-                if angle < 1e-6:
-                    axis = np.array([1, 0, 0], dtype="f4")
-                else:
-                    axis = np.array(
-                        [
-                            rot[2, 1] - rot[1, 2],
-                            rot[0, 2] - rot[2, 0],
-                            rot[1, 0] - rot[0, 1],
-                        ],
-                        dtype="f4",
-                    )
-                    axis = axis / (np.linalg.norm(axis) + 1e-8)
-
-                offsets[i, 0:3] = frac * self.voxel_size * axis
-                rotations[i, 0:3] = rot[:, 0]
-                rotations[i, 4:7] = rot[:, 1]
-                rotations[i, 8:11] = rot[:, 2]
+                offsets[i, 0:3] = offs[i]
+                rotations[i, 0:3] = rot_mats[i, :, 0]
+                rotations[i, 4:7] = rot_mats[i, :, 1]
+                rotations[i, 8:11] = rot_mats[i, :, 2]
 
         return offsets, rotations
 
@@ -522,31 +652,21 @@ class Simulation(mglw.WindowConfig):
         }
 
     def init_buffers(self):
-        # Particle buffers
         self.pos_buf = self.ctx.buffer(reserve=self.num_particles * 16)
         self.vel_buf = self.ctx.buffer(reserve=self.num_particles * 16)
 
-        # Offset buffer for GPU access (vec4 aligned)
         self.offset_buf = self.ctx.buffer(self.offsets.tobytes())
         self.rotation_buf = self.ctx.buffer(self.rotations.tobytes())
 
-        # Mass buffer: one contiguous buffer for all grids
-        # Layout: [grid0_cells..., grid1_cells..., ...]
         cells_per_grid = self.grid_size**self.dim
         total_cells = self.n_grids * cells_per_grid
         self.mass_buf = self.ctx.buffer(reserve=total_cells * 4)
 
     def init_textures(self):
-        """
-        Create textures for each grid independently to avoid spectral leakage.
-        For 2D: Use 3D texture with Z as batch (FFT only on X,Y)
-        For 3D: Use array of 3D textures, one per grid
-        """
         gs = self.grid_size
         ng = self.n_grids
 
         if self.dim == 2:
-            # 2D: Z dimension is batch, no spectral leakage since FFT only on X,Y
             size = (gs, gs, ng)
 
             def create_tex(channels):
@@ -562,9 +682,6 @@ class Simulation(mglw.WindowConfig):
             self.gradient_tex = create_tex(4)
 
         else:
-            # 3D: Pack all grids into single texture with W dimension in Z
-            # Shape: (X, Y, Z * n_grids) where each grid occupies [z*gs : (z+1)*gs]
-            # FFT operates within each grid's Z slice, avoiding spectral leakage
             size = (gs, gs, gs * ng)
 
             def create_tex(channels):
@@ -610,9 +727,9 @@ class Simulation(mglw.WindowConfig):
     def init_particles(self):
         """Initialize particles using GPU Perlin noise for non-uniform distribution."""
         self.init_particles_gpu(
-            noise_scale=4.0,  # Noise frequency (higher = more clusters)
-            density_contrast=2.0,  # Clustering strength (higher = more clustered)
-            seed=None,  # Random seed (None = random)
+            noise_scale=4.0,
+            density_contrast=2.0,
+            seed=None,
         )
 
     def init_particles_gpu(
@@ -633,11 +750,9 @@ class Simulation(mglw.WindowConfig):
 
         n_particles = self.num_particles
 
-        # Bind buffers
         self.pos_buf.bind_to_storage_buffer(0)
         self.vel_buf.bind_to_storage_buffer(1)
 
-        # Set uniforms
         self.prog_init_particles["numParticles"] = n_particles
         self.prog_init_particles["worldSize"] = float(self.world_size)
         self.prog_init_particles["noiseScale"] = float(noise_scale)
@@ -646,7 +761,6 @@ class Simulation(mglw.WindowConfig):
         self.prog_init_particles["baseMass"] = float(self.cfg["particle_mass"])
         self.prog_init_particles["spawnBuffer"] = float(spawn_buffer)
 
-        # Dispatch
         self.prog_init_particles.run((n_particles + 255) // 256)
         self.ctx.memory_barrier()
 
@@ -683,17 +797,16 @@ class Simulation(mglw.WindowConfig):
                 (
                     np.array([-0.2, 0.0, 0.0]),
                     np.array([0.3, 0.1, 0.0]),
-                ),  # galaxy 1: left, moving right
+                ),
                 (
                     np.array([0.2, 0.0, 0.0]),
                     np.array([-0.3, -0.1, 0.0]),
-                ),  # galaxy 2: right, moving left
+                ),
             ]
         ):
             start = i * n_per_galaxy
             end = start + n_per_galaxy
 
-            # spherical distribution with rotation
             r = np.random.exponential(scale=0.08, size=n_per_galaxy) * self.world_size
             theta = np.random.uniform(0, 2 * np.pi, n_per_galaxy)
             phi = np.arccos(np.random.uniform(-1, 1, n_per_galaxy))
@@ -707,7 +820,6 @@ class Simulation(mglw.WindowConfig):
             pos[start:end, 2] = center + offset[2] * self.world_size + z
             pos[start:end, 3] = self.cfg["particle_mass"]
 
-            # 3D circular velocity around random axis per galaxy
             spin_axis = (
                 np.array([0.3, 0.7, 0.5]) if i == 0 else np.array([-0.5, 0.2, 0.8])
             )
@@ -756,7 +868,6 @@ class Simulation(mglw.WindowConfig):
             self.render_prog, [(self.pos_buf, "4f", "in_pos")]
         )
 
-        # Debug grid line rendering
         self.grid_debug_prog = self.ctx.program(
             vertex_shader="""
                 #version 460
@@ -819,16 +930,13 @@ class Simulation(mglw.WindowConfig):
             color = (r, g, b)
             offset = self.offsets[grid_idx][: self.dim]
 
-            # Extract rotation matrix from packed format
             rot_data = self.rotations[grid_idx]
 
             if self.dim == 2:
-                # Unpack mat2 (column-major): col0 at [0:2], col1 at [4:6]
                 rot = np.array(
                     [[rot_data[0], rot_data[4]], [rot_data[1], rot_data[5]]], dtype="f4"
                 )
 
-                # Define unit cell corners centered at origin
                 corners = np.array(
                     [
                         [0, 0],
@@ -839,7 +947,6 @@ class Simulation(mglw.WindowConfig):
                     dtype="f4",
                 )
 
-                # Rotate corners around cell center, then translate
                 cell_center = np.array([vs / 2, vs / 2], dtype="f4")
                 rotated_corners = []
                 for c in corners:
@@ -852,7 +959,6 @@ class Simulation(mglw.WindowConfig):
                     )
                     rotated_corners.append(world)
 
-                # Draw square outline (4 edges)
                 positions.extend(
                     [
                         [rotated_corners[0][0], rotated_corners[0][1], 0],
@@ -867,7 +973,6 @@ class Simulation(mglw.WindowConfig):
                 )
                 colors.extend([color] * 8)
             else:
-                # Unpack mat3 (column-major): col0 at [0:3], col1 at [4:7], col2 at [8:11]
                 rot = np.array(
                     [
                         [rot_data[0], rot_data[4], rot_data[8]],
@@ -877,7 +982,6 @@ class Simulation(mglw.WindowConfig):
                     dtype="f4",
                 )
 
-                # Define unit cube corners centered at origin
                 corners = np.array(
                     [
                         [0, 0, 0],
@@ -892,7 +996,6 @@ class Simulation(mglw.WindowConfig):
                     dtype="f4",
                 )
 
-                # Rotate corners around cell center, then translate
                 cell_center = np.array([vs / 2, vs / 2, vs / 2], dtype="f4")
                 world_offset = np.array(
                     [center + offset[0], center + offset[1], center + offset[2]],
@@ -905,22 +1008,19 @@ class Simulation(mglw.WindowConfig):
                     world = rotated + cell_center + world_offset
                     rotated_corners.append(world)
 
-                # 12 edges of a cube using corner indices
-                # Corners: 0=(0,0,0), 1=(1,0,0), 2=(0,1,0), 3=(1,1,0),
-                #          4=(0,0,1), 5=(1,0,1), 6=(0,1,1), 7=(1,1,1)
                 edges = [
                     (0, 1),
                     (0, 2),
-                    (0, 4),  # from corner 0
+                    (0, 4),
                     (1, 3),
-                    (1, 5),  # from corner 1
+                    (1, 5),
                     (2, 3),
-                    (2, 6),  # from corner 2
-                    (3, 7),  # from corner 3
+                    (2, 6),
+                    (3, 7),
                     (4, 5),
-                    (4, 6),  # from corner 4
+                    (4, 6),
                     (5, 7),
-                    (6, 7),  # from corners 5, 6
+                    (6, 7),
                 ]
                 for i, j in edges:
                     positions.extend(
@@ -958,7 +1058,7 @@ class Simulation(mglw.WindowConfig):
         curr_src = src_tex
         curr_dst = dst_tex
 
-        for axis in [0, 1]:  # X, Y only
+        for axis in [0, 1]:
             self.prog_fft["direction"] = direction
             self.prog_fft["axis"] = axis
             self.prog_fft["gridSize"] = gs
@@ -990,7 +1090,7 @@ class Simulation(mglw.WindowConfig):
         curr_src = src_tex
         curr_dst = dst_tex
 
-        for axis in [0, 1, 2]:  # X, Y, Z (within each grid)
+        for axis in [0, 1, 2]:
             self.prog_fft_batched["direction"] = direction
             self.prog_fft_batched["axis"] = axis
             self.prog_fft_batched["gridSize"] = gs
@@ -1002,7 +1102,6 @@ class Simulation(mglw.WindowConfig):
                 curr_src.bind_to_image(0, read=True, write=False)
                 curr_dst.bind_to_image(1, read=False, write=True)
 
-                # Dispatch: gs×gs threads, ng groups in Z
                 self.prog_fft_batched.run(max(1, gs // 8), max(1, gs // 8), ng)
                 self.ctx.memory_barrier()
 
@@ -1017,7 +1116,6 @@ class Simulation(mglw.WindowConfig):
         n_particles = self.num_particles
         dispatch = (max(1, gs // 8), max(1, gs // 8), ng)
 
-        # Step A: Scatter
         self.clear_mass()
         self.pos_buf.bind_to_storage_buffer(0)
         self.mass_buf.bind_to_storage_buffer(1)
@@ -1030,7 +1128,6 @@ class Simulation(mglw.WindowConfig):
         self.prog_mass.run((n_particles + 255) // 256)
         self.ctx.memory_barrier()
 
-        # Step B.1: Mass -> Complex
         self.mass_buf.bind_to_storage_buffer(0)
         self.complex_tex_a.bind_to_image(1, read=False, write=True)
         self.prog_complex["gridSize"] = gs
@@ -1038,19 +1135,16 @@ class Simulation(mglw.WindowConfig):
         self.prog_complex.run(*dispatch)
         self.ctx.memory_barrier()
 
-        # Step B.2: Forward FFT
         spectrum_tex = self.run_fft_2d(
             self.complex_tex_a, self.complex_tex_b, forward=True
         )
 
-        # Step B.3: Zero DC
         spectrum_tex.bind_to_image(0, read=True, write=True)
         self.prog_fourier["gridSize"] = gs
         self.prog_fourier["nGrids"] = ng
         self.prog_fourier.run(*dispatch)
         self.ctx.memory_barrier()
 
-        # Step B.4: Green's function
         spectrum_tex.bind_to_image(0, read=True, write=False)
         self.grad_comp_x.bind_to_image(1, read=False, write=True)
         self.grad_comp_y.bind_to_image(2, read=False, write=True)
@@ -1061,11 +1155,9 @@ class Simulation(mglw.WindowConfig):
         self.prog_greens.run(*dispatch)
         self.ctx.memory_barrier()
 
-        # Step B.5: Inverse FFT
         real_x = self.run_fft_2d(self.grad_comp_x, self.complex_tex_b, forward=False)
         real_y = self.run_fft_2d(self.grad_comp_y, self.complex_tex_a, forward=False)
 
-        # Step B.6: Pack
         real_x.bind_to_image(0, read=True, write=False)
         real_y.bind_to_image(1, read=True, write=False)
         self.gradient_tex.bind_to_image(3, read=False, write=True)
@@ -1074,7 +1166,6 @@ class Simulation(mglw.WindowConfig):
         self.prog_pack.run(*dispatch)
         self.ctx.memory_barrier()
 
-        # Step C & D: Gather + Integrate
         self.pos_buf.bind_to_storage_buffer(0)
         self.vel_buf.bind_to_storage_buffer(1)
         self.offset_buf.bind_to_storage_buffer(2)
@@ -1097,10 +1188,8 @@ class Simulation(mglw.WindowConfig):
         gs = self.grid_size
         ng = self.n_grids
         n_particles = self.num_particles
-        # Dispatch covers all grids: (gs, gs, gs*ng) total threads
         dispatch = (max(1, gs // 8), max(1, gs // 8), gs * ng)
 
-        # Step A: Scatter (all grids at once)
         self.clear_mass()
         self.pos_buf.bind_to_storage_buffer(0)
         self.mass_buf.bind_to_storage_buffer(1)
@@ -1113,7 +1202,6 @@ class Simulation(mglw.WindowConfig):
         self.prog_mass.run((n_particles + 255) // 256)
         self.ctx.memory_barrier()
 
-        # Step B.1: Mass -> Complex (all grids batched)
         self.mass_buf.bind_to_storage_buffer(0)
         self.complex_tex_a.bind_to_image(1, read=False, write=True)
         set_uniform(self.prog_complex, "gridSize", gs)
@@ -1121,19 +1209,16 @@ class Simulation(mglw.WindowConfig):
         self.prog_complex.run(*dispatch)
         self.ctx.memory_barrier()
 
-        # Step B.2: Forward FFT (batched - processes all grids in parallel)
         spectrum_tex = self.run_fft_3d_batched(
             self.complex_tex_a, self.complex_tex_b, forward=True
         )
 
-        # Step B.3: Zero DC (all grids)
         spectrum_tex.bind_to_image(0, read=True, write=True)
         set_uniform(self.prog_fourier, "gridSize", gs)
         set_uniform(self.prog_fourier, "nGrids", ng)
         self.prog_fourier.run(*dispatch)
         self.ctx.memory_barrier()
 
-        # Step B.4: Green's function (all grids)
         spectrum_tex.bind_to_image(0, read=True, write=False)
         self.grad_comp_x.bind_to_image(1, read=False, write=True)
         self.grad_comp_y.bind_to_image(2, read=False, write=True)
@@ -1145,7 +1230,6 @@ class Simulation(mglw.WindowConfig):
         self.prog_greens.run(*dispatch)
         self.ctx.memory_barrier()
 
-        # Step B.5: Inverse FFT (batched for each component)
         real_x = self.run_fft_3d_batched(
             self.grad_comp_x, self.complex_tex_b, forward=False
         )
@@ -1156,7 +1240,6 @@ class Simulation(mglw.WindowConfig):
             self.grad_comp_z, self.complex_tex_b, forward=False
         )
 
-        # Step B.6: Pack (all grids)
         real_x.bind_to_image(0, read=True, write=False)
         real_y.bind_to_image(1, read=True, write=False)
         real_z.bind_to_image(2, read=True, write=False)
@@ -1166,7 +1249,6 @@ class Simulation(mglw.WindowConfig):
         self.prog_pack.run(*dispatch)
         self.ctx.memory_barrier()
 
-        # Step C & D: Gather from all grids + Integrate
         self.pos_buf.bind_to_storage_buffer(0)
         self.vel_buf.bind_to_storage_buffer(1)
         self.offset_buf.bind_to_storage_buffer(2)
@@ -1213,7 +1295,6 @@ class Simulation(mglw.WindowConfig):
 
         self.vao.render(moderngl.POINTS)
 
-        # Debug grid rendering
         if self.show_grid_debug:
             self.grid_debug_prog["m_view"].write(m_view.tobytes())
             self.grid_debug_prog["m_proj"].write(m_proj.tobytes())
