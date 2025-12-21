@@ -125,7 +125,7 @@ class HierarchicalSE3Sampler:
         # Ratio tells us relative importance
         # If rot_displacement >> trans_displacement, translation matters more
         # because small translations still matter while we've "saturated" rotations
-        ratio = max_trans_displacement / max_rot_displacement
+        # ratio = max_trans_displacement / max_rot_displacement
 
         # Also consider: with many grids, we need finer discrimination
         # More grids → we're slicing SO(3) finer → rotations more important
@@ -138,7 +138,7 @@ class HierarchicalSE3Sampler:
         # Combine factors
         # Base: rotation slightly more important
         base_rot = 0.6
-        base_trans = 0.4
+        # base_trans = 0.4
 
         # Adjust for coarseness (coarser → more translation weight)
         coarse_adjust = 0.15 * (coarseness - 1)  # ±0.15 adjustment
@@ -149,7 +149,7 @@ class HierarchicalSE3Sampler:
         w_rot = np.clip(base_rot - coarse_adjust + count_adjust, 0.3, 0.8)
         w_trans = 1 - w_rot
 
-        print(f"SE(3) Sampler Auto-Tuning:")
+        print("SE(3) Sampler Auto-Tuning:")
         print(f"  voxel_size: {V:.2f}")
         print(f"  char_radius: {char_radius:.2f}")
         print(f"  max_rot_displacement: {max_rot_displacement:.2f}")
@@ -397,7 +397,7 @@ class HierarchicalSE3Sampler:
         # Check if we loaded from cache
         already_cached = self._max_computed >= n
 
-        configs = self.compute_hierarchical(n, verbose)
+        # configs = self.compute_hierarchical(n, verbose)
 
         # Only optimize if we computed new configs (not loaded from cache)
         if optimize and not already_cached:
