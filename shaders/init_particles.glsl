@@ -12,7 +12,8 @@ layout(location = 2) uniform float noiseScale;      // Controls noise frequency
 layout(location = 3) uniform float densityContrast; // Higher = more clustered
 layout(location = 4) uniform uint seed;
 layout(location = 5) uniform float baseMass;
-layout(location = 6) uniform float spawnBuffer;     // Fraction of worldSize to keep clear from edges
+layout(location = 6) uniform
+    float spawnBuffer; // Fraction of worldSize to keep clear from edges
 
 // ============================================================================
 // Hash functions for randomness
@@ -35,17 +36,11 @@ uint hash3(uint x, uint y, uint z) {
   return hash(hash2(x, y) ^ (hash(z) + 0x9e3779b9u));
 }
 
-float rand(uint s) {
-  return float(hash(s)) / 4294967295.0;
-}
+float rand(uint s) { return float(hash(s)) / 4294967295.0; }
 
-vec2 rand2(uint s) {
-  return vec2(rand(s), rand(hash(s)));
-}
+vec2 rand2(uint s) { return vec2(rand(s), rand(hash(s))); }
 
-vec3 rand3(uint s) {
-  return vec3(rand(s), rand(hash(s)), rand(hash(hash(s))));
-}
+vec3 rand3(uint s) { return vec3(rand(s), rand(hash(s)), rand(hash(hash(s)))); }
 
 // ============================================================================
 // Perlin noise implementation
@@ -65,9 +60,7 @@ vec3 grad3(ivec3 p, uint s) {
   return vec3(sin(phi) * cos(theta), sin(phi) * sin(theta), cos(phi));
 }
 
-float fade(float t) {
-  return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
-}
+float fade(float t) { return t * t * t * (t * (t * 6.0 - 15.0) + 10.0); }
 
 float perlin2D(vec2 p, uint s) {
   ivec2 i0 = ivec2(floor(p));
@@ -165,7 +158,8 @@ void main() {
 
   while (attempts < maxAttempts) {
     // Generate uniform random position candidate within spawn region
-    vec2 candidate = rand2(particleSeed + attempts * 1000u) * spawnRange + minBound;
+    vec2 candidate =
+        rand2(particleSeed + attempts * 1000u) * spawnRange + minBound;
 
     // Sample density field using FBM
     vec2 noiseCoord = candidate * noiseScale / worldSize;
@@ -191,7 +185,7 @@ void main() {
   }
 
   // Small random velocity for initial dynamics
-  vec2 vel = (rand2(particleSeed + 999u) - 0.5) * 0.01 * worldSize;
+  vec2 vel = (rand2(particleSeed + 999u) - 0.5) * 1.0 * worldSize;
 
   positions[gID] = vec4(pos, 0.0, baseMass);
   velocities[gID] = vec4(vel, 0.0, 0.0);
@@ -204,7 +198,8 @@ void main() {
 
   while (attempts < maxAttempts) {
     // Generate uniform random position candidate within spawn region
-    vec3 candidate = rand3(particleSeed + attempts * 1000u) * spawnRange + minBound;
+    vec3 candidate =
+        rand3(particleSeed + attempts * 1000u) * spawnRange + minBound;
 
     vec3 noiseCoord = candidate * noiseScale / worldSize;
     float density = fbm3D(noiseCoord, seed, 4);
@@ -225,7 +220,7 @@ void main() {
     pos = rand3(particleSeed) * spawnRange + minBound;
   }
 
-  vec3 vel = (rand3(particleSeed + 999u) - 0.5) * 0.01 * worldSize;
+  vec3 vel = (rand3(particleSeed + 999u) - 0.5) * 1.0 * worldSize;
 
   positions[gID] = vec4(pos, baseMass);
   velocities[gID] = vec4(vel, 0.0);

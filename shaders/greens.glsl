@@ -10,7 +10,7 @@ layout(location = 0) uniform int gridSize;
 layout(location = 1) uniform int nGrids;
 layout(location = 2) uniform float G;
 layout(location = 3) uniform float worldSize;
-layout(location = 4) uniform float epsilon = 1e-3;
+layout(location = 4) uniform float epsilon = 5e-4;
 
 layout(rg32f, binding = 0) readonly uniform image3D inputTexture;
 layout(rg32f, binding = 1) writeonly uniform image3D outGradX;
