@@ -888,6 +888,7 @@ class Simulation(mglw.WindowConfig):
         self.prog_update["nGrids"] = ng
         self.prog_update["worldSize"] = self.world_size
         self.prog_update["voxelSize"] = self.voxel_size
+        self.prog_update["damping"] = self.cfg.get("damping", 1.0)
         self.prog_update.run((n_particles + 255) // 256)
         self.ctx.memory_barrier()
 
@@ -980,6 +981,7 @@ class Simulation(mglw.WindowConfig):
         set_uniform(self.prog_update, "nGrids", ng)
         set_uniform(self.prog_update, "worldSize", self.world_size)
         set_uniform(self.prog_update, "voxelSize", self.voxel_size)
+        set_uniform(self.prog_update, "damping", self.cfg.get("damping", 1.0))
         self.prog_update.run((n_particles + 255) // 256)
         self.ctx.memory_barrier()
 

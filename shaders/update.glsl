@@ -17,6 +17,7 @@ layout(location = 1) uniform int gridSize;
 layout(location = 2) uniform int nGrids;
 layout(location = 3) uniform float worldSize;
 layout(location = 4) uniform float voxelSize;
+layout(location = 5) uniform float damping;
 
 #if DIM == 2
 mat2 getRotation(int gridIdx) {
@@ -84,6 +85,7 @@ void main() {
   vec2 avgForce = totalForce / float(nGrids);
 
   vel -= avgForce * deltaTime;
+  vel *= damping;
   pos += vel * deltaTime;
   pos = mod(pos, worldSize);
 
@@ -114,6 +116,7 @@ void main() {
   vec3 avgForce = totalForce / float(nGrids);
 
   vel -= avgForce * deltaTime;
+  vel *= damping;
   pos += vel * deltaTime;
   pos = mod(pos, worldSize);
 
