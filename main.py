@@ -476,7 +476,7 @@ class Simulation(mglw.WindowConfig):
         self.grid_debug_prog["world_size"] = self.world_size
         self.init_grid_debug_geometry()
 
-    def init_grid_debug_geometry(self, cells_per_axis=6, max_grids=None):
+    def init_grid_debug_geometry(self, cells_per_axis=8, max_grids=None):
         def hsv_to_rgb(h, s, v):
             i = int(h * 6)
             f = h * 6 - i
