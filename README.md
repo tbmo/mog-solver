@@ -39,6 +39,13 @@ The transforms are generated using a 6D Halton sequence mapped through Hopf fibr
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+# Find the staggered grid paper
+# Find everything that has cited it
+# Make sure nothing better than my algorithm
+
+# Generalized to the material point method
+
+
 ## Requirements
 
 - Python 3.8+
