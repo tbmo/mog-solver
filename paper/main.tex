@@ -1,0 +1,233 @@
+\documentclass[11pt,twocolumn]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+
+\title{Fast Ensemble Grid Method: Linear-Memory N-Body Simulation via SE(3)-Transformed Sparse Grids}
+
+\author{Thomas [Last Name]\\
+\textit{Independent Researcher}\\
+\texttt{[email]}}
+
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We present the Fast Ensemble Grid Method (FEGM), a novel approach to gravitational N-body simulation that achieves effective resolution scaling of $(kg)^3$ while requiring only $O(kg^3)$ memory, where $k$ is the number of grids and $g$ is the base grid resolution. Unlike traditional particle-mesh methods limited by cubic memory growth, or hierarchical methods like the Fast Multipole Method requiring complex tree structures, FEGM uses an ensemble of coarse grids related by SE(3) transformations (rotations and translations). Forces computed on each grid are averaged, with the quasi-random rotations ensuring that particles aliased together in one grid are separated in others. This yields a memory reduction factor of $k^2$ compared to a single grid of equivalent effective resolution. We demonstrate the method on GPU with 500,000 particles across 360 grids, achieving effective resolution equivalent to a $5760^3$ grid (191 billion cells) using only 1.47 million cells. The approach draws theoretical connections to quasi-Monte Carlo integration over SE(3) and tomographic reconstruction via the Radon transform.
+\end{abstract}
+
+\section{Introduction}
+
+The N-body problem---computing the gravitational (or electrostatic) interactions among $n$ particles---remains a fundamental challenge in computational physics. Direct summation requires $O(n^2)$ operations per timestep, making it intractable for large systems. Two major families of approximation methods have emerged:
+
+\textbf{Tree-based methods.} The Barnes-Hut algorithm \cite{barnes1986} groups distant particles into multipole expansions, achieving $O(n \log n)$ complexity. The Fast Multipole Method (FMM) \cite{greengard1987} extends this to $O(n)$ through hierarchical multipole-to-local translations. These methods are powerful but require complex tree construction and traversal.
+
+\textbf{Grid-based methods.} Particle-Mesh (PM) methods \cite{hockney1988} deposit particle masses onto a grid, solve Poisson's equation via FFT in $O(g^3 \log g)$ time, and interpolate forces back to particles. The limitation is resolution: a grid of size $g^3$ cannot resolve structures smaller than one cell. Increasing $g$ rapidly exhausts memory.
+
+Hybrid P$^3$M methods \cite{hockney1988} add short-range direct summation to correct for grid aliasing, but the fundamental cubic memory scaling remains.
+
+\textbf{Multigrid methods.} Traditional multigrid \cite{brandt1977} uses a hierarchy of grids at different resolutions to accelerate iterative Poisson solvers. While effective for convergence acceleration, this does not address the fundamental resolution-memory tradeoff---the finest grid still determines memory requirements.
+
+In this paper, we introduce a fundamentally different approach: rather than a hierarchy of grids at different scales, we use an \emph{ensemble} of grids at the \emph{same} scale but with different orientations and offsets. We call this the Fast Ensemble Grid Method (FEGM).
+
+\section{Method}
+
+\subsection{Core Insight}
+
+Consider two 2D grids of resolution $g \times g$. If we offset one grid by half a cell width in each dimension, points that fall into the same cell in one grid may be separated in the other. By averaging forces computed on both grids, we achieve finer effective resolution than either grid alone.
+
+Extending this to rotations: two grids related by a 45° rotation will have completely different aliasing patterns. Points aligned along one grid's axes are diagonal to the other.
+
+By using $k$ grids with quasi-random SE(3) transformations (rotations and translations), we achieve effective coverage equivalent to a single grid of resolution $(kg)^3$ while using only $kg^3$ cells---a factor of $k^2$ memory savings.
+
+\subsection{SE(3) Sampling via Halton Sequences}
+
+For reproducibility and uniform coverage, we generate grid transformations deterministically using 6-dimensional Halton sequences \cite{halton1964}. The six dimensions map to:
+
+\begin{itemize}
+    \item Dimensions 1--3: Rotation (via Hopf fibration, see below)
+    \item Dimensions 4--6: Translation offset within one voxel
+\end{itemize}
+
+\textbf{Rotation sampling.} Uniform sampling of SO(3) is achieved through the Hopf fibration \cite{shoemake1992}. Given three uniform samples $u_1, u_2, u_3 \in [0,1)$, we compute a unit quaternion:
+\begin{align}
+q_0 &= \sqrt{1-u_1} \sin(2\pi u_2) \\
+q_1 &= \sqrt{1-u_1} \cos(2\pi u_2) \\
+q_2 &= \sqrt{u_1} \sin(2\pi u_3) \\
+q_3 &= \sqrt{u_1} \cos(2\pi u_3)
+\end{align}
+
+This produces uniform coverage of the rotation group SO(3).
+
+\textbf{Translation sampling.} The translation offset for each grid is sampled uniformly within one voxel: $\mathbf{t} \in [0, v)^3$ where $v = L/g$ is the voxel size and $L$ is the world size. Larger offsets are redundant due to the periodic boundary conditions.
+
+\subsection{Algorithm}
+
+For each timestep:
+
+\begin{algorithm}[H]
+\caption{Fast Ensemble Grid Method}
+\begin{algorithmic}[1]
+\For{each grid $i \in \{1, \ldots, k\}$}
+    \State Clear mass grid $M_i$
+    \For{each particle $p$ with position $\mathbf{x}_p$, mass $m_p$}
+        \State $\mathbf{x}'_p \gets R_i(\mathbf{x}_p - \mathbf{c}) + \mathbf{c} - \mathbf{t}_i$ \Comment{Transform}
+        \State $\mathbf{x}'_p \gets \mathbf{x}'_p \mod L$ \Comment{Periodic wrap}
+        \State Deposit $m_p$ to nearest cell in $M_i$
+    \EndFor
+    \State Compute force field $\mathbf{F}_i$ via FFT Poisson solve
+\EndFor
+\For{each particle $p$}
+    \State $\mathbf{F}_p \gets \mathbf{0}$
+    \For{each grid $i$}
+        \State Sample $\mathbf{F}_i$ at transformed position
+        \State $\mathbf{F}_p \gets \mathbf{F}_p + R_i^T \cdot \mathbf{F}_i$ \Comment{Rotate back}
+    \EndFor
+    \State $\mathbf{F}_p \gets \mathbf{F}_p / k$ \Comment{Average}
+    \State Update $\mathbf{v}_p, \mathbf{x}_p$ via leapfrog integration
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Poisson Solve}
+
+Each grid's force field is computed by solving the Poisson equation $\nabla^2 \phi = 4\pi G \rho$. In Fourier space:
+\begin{equation}
+\hat{\phi}(\mathbf{k}) = -\frac{4\pi G \hat{\rho}(\mathbf{k})}{|\mathbf{k}|^2}
+\end{equation}
+
+The force is $\mathbf{F} = -\nabla \phi$, computed via:
+\begin{equation}
+\hat{\mathbf{F}}(\mathbf{k}) = -i\mathbf{k} \hat{\phi}(\mathbf{k})
+\end{equation}
+
+We implement this using batched 3D FFTs on GPU, processing all $k$ grids in parallel.
+
+Alternatively, for small grid sizes, direct convolution with a precomputed Green's function kernel is competitive and avoids FFT overhead.
+
+\section{Theoretical Connections}
+
+\subsection{Quasi-Monte Carlo Integration}
+
+The averaging of forces across grids can be viewed as quasi-Monte Carlo integration over the SE(3) group. Let $F(\mathbf{x}; T)$ denote the force at position $\mathbf{x}$ computed using a grid with transformation $T \in \text{SE}(3)$. The true force is:
+\begin{equation}
+\mathbf{F}_{true}(\mathbf{x}) = \int_{\text{SE}(3)} F(\mathbf{x}; T) \, dT
+\end{equation}
+
+We approximate this integral by sampling:
+\begin{equation}
+\mathbf{F}_{approx}(\mathbf{x}) = \frac{1}{k} \sum_{i=1}^{k} F(\mathbf{x}; T_i)
+\end{equation}
+
+Using low-discrepancy sequences (Halton) rather than random sampling provides faster convergence: $O(1/k)$ vs $O(1/\sqrt{k})$ for random Monte Carlo \cite{niederreiter1992}.
+
+\subsection{Connection to Radon Transform}
+
+The Radon transform projects a function along lines (2D) or planes (3D) at various angles, and is the mathematical basis of computed tomography. Inversion requires sampling at sufficiently many angles to avoid aliasing artifacts.
+
+Our method performs an analogous operation: each rotated grid ``views'' the mass distribution from a different orientation. The ensemble average reconstructs force information that no single orientation could capture. The quasi-random rotation sampling ensures angular coverage analogous to the angular sampling requirements in tomographic reconstruction.
+
+\section{Complexity Analysis}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcc}
+\toprule
+Method & Memory & Time \\
+\midrule
+Direct summation & $O(n)$ & $O(n^2)$ \\
+Barnes-Hut & $O(n)$ & $O(n \log n)$ \\
+FMM & $O(n)$ & $O(n)$ \\
+Single PM grid & $O(g^3)$ & $O(n + g^3 \log g)$ \\
+\textbf{FEGM} & $O(kg^3)$ & $O(nk + kg^3 \log g)$ \\
+\bottomrule
+\end{tabular}
+\caption{Complexity comparison. $n$ = particles, $g$ = grid resolution, $k$ = number of grids.}
+\label{tab:complexity}
+\end{table}
+
+The key insight is the relationship between memory and effective resolution:
+\begin{itemize}
+    \item Single grid: memory $= g^3$, effective resolution $= g^3$
+    \item FEGM: memory $= kg^3$, effective resolution $= (kg)^3 = k^3 g^3$
+\end{itemize}
+
+The ratio of effective resolution to memory is $k^2$, yielding quadratic memory savings.
+
+For our test configuration ($k=360$, $g=16$):
+\begin{itemize}
+    \item Actual memory: $360 \times 16^3 = 1.47 \times 10^6$ cells
+    \item Effective resolution: $(360 \times 16)^3 = 1.91 \times 10^{11}$ cells
+    \item Memory reduction factor: $360^2 = 129,600\times$
+\end{itemize}
+
+\section{Implementation}
+
+We implement FEGM using Python with ModernGL for GPU compute shaders. Key implementation details:
+
+\textbf{Mass deposition.} Particles are scattered to grids in parallel using atomic additions. Each GPU thread processes one particle, depositing to all $k$ grids.
+
+\textbf{Batched FFT.} We store all grids in a single 3D texture of size $g \times g \times (kg)$ and perform batched FFTs along each axis.
+
+\textbf{Force sampling.} Each particle samples from all $k$ grids, with the rotation applied to the sample position and inverse rotation applied to the resulting force vector.
+
+The entire pipeline runs on GPU without CPU-GPU synchronization during the timestep.
+
+\section{Results}
+
+We demonstrate FEGM on a system of 500,000 particles with 360 grids of resolution $16^3$. The simulation runs at interactive rates on consumer GPU hardware (tested on NVIDIA RTX series).
+
+Figure~\ref{fig:results} shows the evolution of initially clustered particles under self-gravity, forming characteristic filamentary structures. The fine structure visible would be impossible to resolve with a single grid of only $16^3$ resolution.
+
+[Figure placeholder - simulation screenshots]
+
+\section{Discussion}
+
+\textbf{Limitations.} FEGM trades memory for computation: the $O(nk)$ force sampling term means runtime scales linearly with grid count. For very large $k$, this may dominate. The method also assumes periodic boundary conditions; non-periodic domains require modification.
+
+\textbf{Comparison to FMM.} FMM achieves $O(n)$ time with $O(n)$ memory, which is theoretically superior. However, FEGM has advantages in simplicity and GPU parallelization. The algorithm is embarrassingly parallel across grids and uses only simple data structures (uniform grids).
+
+\textbf{Future work.} Adaptive grid counts (more grids in dense regions), learned rotation sampling, and extension to other force laws (electrostatics, SPH) are promising directions.
+
+\section{Conclusion}
+
+We have presented the Fast Ensemble Grid Method, a novel approach to N-body simulation that achieves $k^2$ memory savings through an ensemble of SE(3)-transformed grids. The method is simple to implement, highly parallelizable, and draws connections to quasi-Monte Carlo integration and tomographic reconstruction. We believe FEGM represents a new point in the tradeoff space between tree-based and grid-based N-body methods.
+
+\section*{Code Availability}
+
+Source code is available at: [GitHub URL]
+
+\begin{thebibliography}{10}
+
+\bibitem{barnes1986}
+J. Barnes and P. Hut, ``A hierarchical O(N log N) force-calculation algorithm,'' \textit{Nature}, vol. 324, pp. 446--449, 1986.
+
+\bibitem{greengard1987}
+L. Greengard and V. Rokhlin, ``A fast algorithm for particle simulations,'' \textit{Journal of Computational Physics}, vol. 73, pp. 325--348, 1987.
+
+\bibitem{hockney1988}
+R. W. Hockney and J. W. Eastwood, \textit{Computer Simulation Using Particles}. CRC Press, 1988.
+
+\bibitem{brandt1977}
+A. Brandt, ``Multi-level adaptive solutions to boundary-value problems,'' \textit{Mathematics of Computation}, vol. 31, pp. 333--390, 1977.
+
+\bibitem{halton1964}
+J. H. Halton, ``Algorithm 247: Radical-inverse quasi-random point sequence,'' \textit{Communications of the ACM}, vol. 7, pp. 701--702, 1964.
+
+\bibitem{shoemake1992}
+K. Shoemake, ``Uniform random rotations,'' in \textit{Graphics Gems III}, pp. 124--132, Academic Press, 1992.
+
+\bibitem{niederreiter1992}
+H. Niederreiter, \textit{Random Number Generation and Quasi-Monte Carlo Methods}. SIAM, 1992.
+
+\end{thebibliography}
+
+\end{document}

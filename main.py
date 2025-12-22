@@ -1,10 +1,3 @@
-"""
-Linear-Sparse-Grid N-Body Solver (3D)
-
-Achieves high effective resolution by stacking multiple low-resolution grids
-with diagonal spatial offsets, scaling linearly O(n) rather than quadratically O(n²).
-"""
-
 import numpy as np
 import moderngl
 import moderngl_window as mglw
@@ -13,13 +6,7 @@ import yaml
 
 
 class FastSE3Sampler:
-    """
-    Deterministic SE(3) sampler using 6D Halton Sequences.
-    Maps [0,1]^6 -> SO(3) x [0,voxel]^3
-    """
-
     def __init__(self, grid_size, world_size, n_grids, seed=None):
-        # Seed is unused for Halton (it's deterministic), but kept for API compatibility
         self.grid_size = grid_size
         self.world_size = world_size
         self.voxel_size = world_size / grid_size
@@ -30,10 +17,6 @@ class FastSE3Sampler:
         self._quats = None
 
     def _halton_sequence(self, index, base):
-        """
-        Computes the n-th term of the Halton sequence for a given base.
-        Returns a float in [0, 1).
-        """
         result = 0.0
         f = 1.0 / base
         i = index
@@ -46,15 +29,8 @@ class FastSE3Sampler:
     def generate_deterministic(self):
         n = self.n_grids
 
-        # We need 6 dimensions: 3 for Rotation, 3 for Translation.
-        # We use the first 6 prime numbers as bases to ensure independence.
-        # Bases: 2, 3, 5 (Rotation), 7, 11, 13 (Translation)
-
-        # 1. Generate the raw 6D sequence
-        # We skip the first 100 to avoid the initial "clump" near zero common in Halton
         start_idx = 100
 
-        # Dimensions 0-2: Rotation parameters
         u1 = np.array(
             [self._halton_sequence(i, 2) for i in range(start_idx, start_idx + n)]
         )
@@ -65,7 +41,6 @@ class FastSE3Sampler:
             [self._halton_sequence(i, 5) for i in range(start_idx, start_idx + n)]
         )
 
-        # Dimensions 3-5: Translation parameters
         v1 = np.array(
             [self._halton_sequence(i, 7) for i in range(start_idx, start_idx + n)]
         )
@@ -76,12 +51,9 @@ class FastSE3Sampler:
             [self._halton_sequence(i, 13) for i in range(start_idx, start_idx + n)]
         )
 
-        # --- MAPPING 1: ROTATIONS (Hopf Fibration) ---
-        # Maps u1, u2, u3 -> Unit Quaternion
         sqrt_1_minus_u1 = np.sqrt(1 - u1)
         sqrt_u1 = np.sqrt(u1)
 
-        # Standard Hopf mapping
         q0 = sqrt_1_minus_u1 * np.sin(2 * np.pi * u2)
         q1 = sqrt_1_minus_u1 * np.cos(2 * np.pi * u2)
         q2 = sqrt_u1 * np.sin(2 * np.pi * u3)
@@ -89,18 +61,14 @@ class FastSE3Sampler:
 
         self._quats = np.stack([q0, q1, q2, q3], axis=1).astype(np.float32)
 
-        # --- MAPPING 2: OFFSETS (Voxel Space) ---
-        # Maps v1, v2, v3 -> [0, voxel_size]^3
         self._offsets = np.stack([v1, v2, v3], axis=1).astype(np.float32)
         self._offsets *= self.voxel_size
 
-        # Convert quaternions to matrices
         self._rotations = np.array([self._quat_to_matrix(q) for q in self._quats])
 
         return self._rotations, self._offsets
 
     def get_transforms(self, verbose=True):
-        # Wrapper to match your existing API
         if verbose:
             print(
                 f"  Generating {self.n_grids} deterministic SE(3) transforms (6D Halton)..."
@@ -108,36 +76,24 @@ class FastSE3Sampler:
         return self.generate_deterministic()
 
     def analyze_coverage(self):
-        """Check how well we covered the 6D space."""
-        if self._offsets is None:
-            return
+        return
+        # if self._offsets is None:
+        #     return
 
-        # 1. Offset Coverage
-        diff = self._offsets[:, None, :] - self._offsets[None, :, :]
-        diff = diff - self.voxel_size * np.round(diff / self.voxel_size)
-        off_dists = np.linalg.norm(diff, axis=2)
-        np.fill_diagonal(off_dists, np.inf)
-        min_off = np.min(off_dists)
+        # diff = self._offsets[:, None, :] - self._offsets[None, :, :]
+        # diff = diff - self.voxel_size * np.round(diff / self.voxel_size)
+        # off_dists = np.linalg.norm(diff, axis=2)
+        # np.fill_diagonal(off_dists, np.inf)
+        # min_off = np.min(off_dists)
 
-        # 2. Rotation Coverage
-        # Quaternion distance: 2*arccos(|q1.q2|)
-        dot = np.abs(np.sum(self._quats[:, None, :] * self._quats[None, :, :], axis=2))
-        np.clip(dot, 0, 1, out=dot)
-        rot_dists = 2 * np.arccos(dot)
-        np.fill_diagonal(rot_dists, np.inf)
-        min_rot = np.min(rot_dists)
+        # dot = np.abs(np.sum(self._quats[:, None, :] * self._quats[None, :, :], axis=2))
+        # np.clip(dot, 0, 1, out=dot)
+        # rot_dists = 2 * np.arccos(dot)
+        # np.fill_diagonal(rot_dists, np.inf)
+        # min_rot = np.min(rot_dists)
 
-        print("  Coverage Analysis (Deterministic):")
-        print(
-            f"    Min Offset Separation: {min_off:.4f} (Ideal random ~{self.voxel_size / self.n_grids**0.33:.2f})"
-        )
-        print(f"    Min Angular Separation: {np.degrees(min_rot):.1f}°")
-
-        # Simple check for 'bad' pairs (close in BOTH rotation AND translation)
-        # Normalize both to [0,1] roughly
-        combined_score = (off_dists / self.voxel_size) + (rot_dists / np.pi)
-        min_combined = np.min(combined_score)
-        print(f"    Min Combined Separation: {min_combined:.4f} (Higher is better)")
+        # combined_score = (off_dists / self.voxel_size) + (rot_dists / np.pi)
+        # min_combined = np.min(combined_score)
 
     def _quat_to_matrix(self, q):
         w, x, y, z = q
@@ -164,7 +120,7 @@ class FastSE3Sampler:
                 [0.0, 0.0, 0.0, 1.0],
             ],
             dtype=np.float32,
-        ).T[:3, :4]  # Return 3x4 matrix (padded)
+        ).T[:3, :4]
 
 
 def set_uniform(prog, name, value):
@@ -352,11 +308,9 @@ class Simulation(mglw.WindowConfig):
         self.prog_convolve = self.ctx.compute_shader(load("convolve.glsl"))
 
     def init_greens_kernel(self):
-        """Precompute the real-space Green's gradient kernel for 3D."""
         gs = self.grid_size
         voxel = self.voxel_size
 
-        # Pack as vec4 for better GPU memory alignment (16-byte aligned reads)
         kernel = np.zeros((gs, gs, gs, 4), dtype="f4")
 
         for iz in range(gs):
@@ -373,12 +327,10 @@ class Simulation(mglw.WindowConfig):
                     r = np.sqrt(r2)
 
                     if r > 1e-10:
-                        # For gravity: attractive force points toward source
                         factor = 1.0 / (4.0 * np.pi * r2 * r)
                         kernel[iz, iy, ix, 0] = rx * factor
                         kernel[iz, iy, ix, 1] = ry * factor
                         kernel[iz, iy, ix, 2] = rz * factor
-                        # kernel[iz, iy, ix, 3] = 0 (padding)
 
         print(f"Green's kernel (3D): {gs}x{gs}x{gs}x4, voxel={voxel:.2f}")
 
@@ -524,7 +476,7 @@ class Simulation(mglw.WindowConfig):
         self.grid_debug_prog["world_size"] = self.world_size
         self.init_grid_debug_geometry()
 
-    def init_grid_debug_geometry(self, cells_per_axis=3, max_grids=None):
+    def init_grid_debug_geometry(self, cells_per_axis=6, max_grids=None):
         def hsv_to_rgb(h, s, v):
             i = int(h * 6)
             f = h * 6 - i
