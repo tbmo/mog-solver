@@ -10,7 +10,8 @@ layout(location = 0) uniform int gridSize;
 layout(location = 1) uniform int nGrids;
 layout(location = 2) uniform float G;
 layout(location = 3) uniform float worldSize;
-layout(location = 4) uniform float epsilon = 5e-4;
+// layout(location = 4) uniform float epsilon = 5e-4;
+layout(location = 4) uniform float epsilon = 1e-2;
 
 layout(rg32f, binding = 0) readonly uniform image3D inputTexture;
 layout(rg32f, binding = 1) writeonly uniform image3D outGradX;
@@ -50,10 +51,13 @@ void main() {
   vec2 rhoHat = imageLoad(inputTexture, pos).xy;
   vec2 phiHat = vec2(0.0);
 
-  if (k2 > epsilon) {
-    phiHat = rhoHat * (geoFactor * G / k2);
-  }
+  // if (k2 > epsilon) {
+  // phiHat = rhoHat * (geoFactor * G / k2);
+  // }
 
+  // Use a soft rolloff:
+  float k2_reg = k2 + epsilon; // Simple regularization
+  phiHat = rhoHat * (geoFactor * G / k2_reg);
   vec2 gradXHat = mult_ik(phiHat, kx);
   vec2 gradYHat = mult_ik(phiHat, ky);
 
