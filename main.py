@@ -305,7 +305,6 @@ class Simulation(mglw.WindowConfig):
         self.prog_pack = self.ctx.compute_shader(load("pack.glsl"))
         self.prog_update = self.ctx.compute_shader(load("update.glsl"))
         self.prog_init_particles = self.ctx.compute_shader(load("init_particles.glsl"))
-        self.prog_convolve = self.ctx.compute_shader(load("convolve.glsl"))
 
     def init_greens_kernel(self):
         gs = self.grid_size
@@ -476,7 +475,7 @@ class Simulation(mglw.WindowConfig):
         self.grid_debug_prog["world_size"] = self.world_size
         self.init_grid_debug_geometry()
 
-    def init_grid_debug_geometry(self, cells_per_axis=8, max_grids=None):
+    def init_grid_debug_geometry(self, cells_per_axis=8, max_grids=1):
         def hsv_to_rgb(h, s, v):
             i = int(h * 6)
             f = h * 6 - i
@@ -698,54 +697,8 @@ class Simulation(mglw.WindowConfig):
         self.prog_update.run((n_particles + 255) // 256)
         self.ctx.memory_barrier()
 
-    def step_convolve(self):
-        """Simulation step using direct convolution (no FFT)."""
-        gs = self.grid_size
-        ng = self.n_grids
-        n_particles = self.num_particles
-        dispatch = (max(1, gs // 8), max(1, gs // 8), gs * ng)
-
-        self.clear_mass()
-        self.pos_buf.bind_to_storage_buffer(0)
-        self.mass_buf.bind_to_storage_buffer(1)
-        self.offset_buf.bind_to_storage_buffer(2)
-        self.rotation_buf.bind_to_storage_buffer(3)
-        set_uniform(self.prog_mass, "gridSize", gs)
-        set_uniform(self.prog_mass, "nGrids", ng)
-        set_uniform(self.prog_mass, "voxelSize", self.voxel_size)
-        set_uniform(self.prog_mass, "worldSize", self.world_size)
-        self.prog_mass.run((n_particles + 255) // 256)
-        self.ctx.memory_barrier()
-
-        self.mass_buf.bind_to_storage_buffer(0)
-        self.green_kernel_buf.bind_to_storage_buffer(1)
-        self.gradient_tex.bind_to_image(0, read=False, write=True)
-        set_uniform(self.prog_convolve, "gridSize", gs)
-        set_uniform(self.prog_convolve, "nGrids", ng)
-        set_uniform(self.prog_convolve, "G", self.G)
-        set_uniform(self.prog_convolve, "worldSize", self.world_size)
-        self.prog_convolve.run(*dispatch)
-        self.ctx.memory_barrier()
-
-        self.pos_buf.bind_to_storage_buffer(0)
-        self.vel_buf.bind_to_storage_buffer(1)
-        self.offset_buf.bind_to_storage_buffer(2)
-        self.rotation_buf.bind_to_storage_buffer(3)
-        self.gradient_tex.bind_to_image(0, read=True, write=False)
-        set_uniform(self.prog_update, "deltaTime", self.dt * self.timescale)
-        set_uniform(self.prog_update, "gridSize", gs)
-        set_uniform(self.prog_update, "nGrids", ng)
-        set_uniform(self.prog_update, "worldSize", self.world_size)
-        set_uniform(self.prog_update, "voxelSize", self.voxel_size)
-        set_uniform(self.prog_update, "damping", self.cfg.get("damping", 1.0))
-        self.prog_update.run((n_particles + 255) // 256)
-        self.ctx.memory_barrier()
-
     def step(self):
-        if self.use_convolution:
-            self.step_convolve()
-        else:
-            self.step_fft()
+        self.step_fft()
 
     def on_render(self, time, frame_time):
         if not self.paused:
