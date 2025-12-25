@@ -788,6 +788,11 @@ class Simulation(mglw.WindowConfig):
                 mode = "Direct Convolution" if self.use_convolution else "FFT"
                 print(f"Solver: {mode}")
 
+            elif key == keys.F:
+                from force_probe import probe_force_law_v2
+
+                probe_force_law_v2(self)
+
 
 if __name__ == "__main__":
     mglw.run_window_config(Simulation, args=["--window", "glfw"])
