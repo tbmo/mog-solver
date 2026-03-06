@@ -359,6 +359,7 @@ class Simulation(mglw.WindowConfig):
         self.prog_init_particles["seed"] = int(seed)
         self.prog_init_particles["baseMass"] = float(self.cfg["particle_mass"])
         self.prog_init_particles["spawnBuffer"] = float(spawn_buffer)
+        self.prog_init_particles["spawnShape"] = 1  # Sphere
 
         self.prog_init_particles.run((n_particles + 255) // 256)
         self.ctx.memory_barrier()
