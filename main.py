@@ -5,6 +5,46 @@ from pathlib import Path
 import yaml
 
 
+class RandomSE3Sampler:
+    def __init__(self, grid_size, world_size, n_grids, seed=None):
+        self.grid_size = grid_size
+        self.world_size = world_size
+        self.voxel_size = world_size / grid_size
+        self.n_grids = n_grids
+        self.seed = seed
+
+    def generate(self):
+        rng = np.random.default_rng(self.seed)
+        n = self.n_grids
+
+        # Uniform random rotations via Shoemake method
+        u = rng.uniform(0, 1, (n, 3))
+        q0 = np.sqrt(1 - u[:, 0]) * np.sin(2 * np.pi * u[:, 1])
+        q1 = np.sqrt(1 - u[:, 0]) * np.cos(2 * np.pi * u[:, 1])
+        q2 = np.sqrt(u[:, 0])     * np.sin(2 * np.pi * u[:, 2])
+        q3 = np.sqrt(u[:, 0])     * np.cos(2 * np.pi * u[:, 2])
+        quats = np.stack([q0, q1, q2, q3], axis=1).astype(np.float32)
+
+        # Uniform random offsets within one voxel
+        offsets = rng.uniform(0, self.voxel_size, (n, 3)).astype(np.float32)
+
+        rotations = np.array([self._quat_to_matrix(q) for q in quats])
+        return rotations, offsets
+
+    def get_transforms(self, verbose=True):
+        if verbose:
+            print(f"  Generating {self.n_grids} random SE(3) transforms...")
+        return self.generate()
+
+    def _quat_to_matrix(self, q):
+        w, x, y, z = q
+        return np.array([
+            [1-2*y*y-2*z*z,  2*x*y-2*z*w,    2*x*z+2*y*w,    0.],
+            [2*x*y+2*z*w,    1-2*x*x-2*z*z,  2*y*z-2*x*w,    0.],
+            [2*x*z-2*y*w,    2*y*z+2*x*w,    1-2*x*x-2*y*y,  0.],
+            [0.,             0.,             0.,             1.],
+        ], dtype=np.float32).T[:3, :4]
+
 class FastSE3Sampler:
     def __init__(self, grid_size, world_size, n_grids, seed=None):
         self.grid_size = grid_size
@@ -219,7 +259,7 @@ class Simulation(mglw.WindowConfig):
         offsets = np.zeros((self.n_grids, 4), dtype="f4")
         rotations = np.zeros((self.n_grids, 12), dtype="f4")
 
-        sampler = FastSE3Sampler(
+        sampler = RandomSE3Sampler(
             grid_size=self.grid_size,
             world_size=self.world_size,
             n_grids=self.n_grids,
