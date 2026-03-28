@@ -1,6 +1,6 @@
 # Linear-Sparse-Grid Configuration
-n_grids: 120            # Number of offset grids, should be a multiple of 24 because crystals or something
-grid_size: 32           # Base resolution per grid (16x16x16)
+n_grids: 240            # Number of offset grids, should be a multiple of 24 because crystals or something
+grid_size: 16           # Base resolution per grid (16x16x16)
 world_size: 100.0
 num_particles: 1e6
 G: 100.0
@@ -14,5 +14,5 @@ damping: 0.999
 solver: fft
 
 # Particle initialization
-spawn_buffer: 0.05       # Fraction of world_size to keep clear from edges (0.0-0.5)
+spawn_buffer: 0.0       # Fraction of world_size to keep clear from edges (0.0-0.5)
 
