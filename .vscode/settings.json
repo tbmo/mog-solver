@@ -25,5 +25,5 @@
         "workbench.files.action.collapseExplorerFolders",
         "workbench.files.action.focusFilesExplorer"
     ],
-    "superkeys.dryrun": true
+    "superkeys.dryrun": false
 }
