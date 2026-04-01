@@ -3,164 +3,87 @@ import moderngl
 import moderngl_window as mglw
 from pathlib import Path
 import yaml
-
+from scipy.stats import qmc # Quasi-Monte Carlo
 
 class RandomSE3Sampler:
+
     def __init__(self, grid_size, world_size, n_grids, seed=None):
+
         self.grid_size = grid_size
+
         self.world_size = world_size
+
         self.voxel_size = world_size / grid_size
+
         self.n_grids = n_grids
+
         self.seed = seed
 
+
+
     def generate(self):
+
         rng = np.random.default_rng(self.seed)
+
         n = self.n_grids
+
+
 
         # Uniform random rotations via Shoemake method
+
         u = rng.uniform(0, 1, (n, 3))
+
         q0 = np.sqrt(1 - u[:, 0]) * np.sin(2 * np.pi * u[:, 1])
+
         q1 = np.sqrt(1 - u[:, 0]) * np.cos(2 * np.pi * u[:, 1])
+
         q2 = np.sqrt(u[:, 0])     * np.sin(2 * np.pi * u[:, 2])
+
         q3 = np.sqrt(u[:, 0])     * np.cos(2 * np.pi * u[:, 2])
+
         quats = np.stack([q0, q1, q2, q3], axis=1).astype(np.float32)
 
+
+
         # Uniform random offsets within one voxel
+
         offsets = rng.uniform(0, self.voxel_size, (n, 3)).astype(np.float32)
 
+
+
         rotations = np.array([self._quat_to_matrix(q) for q in quats])
+
         return rotations, offsets
 
-    def get_transforms(self, verbose=True):
+
+
+    def get_transforms(self, verbose=False):
+
         if verbose:
+
             print(f"  Generating {self.n_grids} random SE(3) transforms...")
+
         return self.generate()
 
+
+
     def _quat_to_matrix(self, q):
+
         w, x, y, z = q
+
         return np.array([
+
             [1-2*y*y-2*z*z,  2*x*y-2*z*w,    2*x*z+2*y*w,    0.],
+
             [2*x*y+2*z*w,    1-2*x*x-2*z*z,  2*y*z-2*x*w,    0.],
+
             [2*x*z-2*y*w,    2*y*z+2*x*w,    1-2*x*x-2*y*y,  0.],
+
             [0.,             0.,             0.,             1.],
+
         ], dtype=np.float32).T[:3, :4]
 
-class FastSE3Sampler:
-    def __init__(self, grid_size, world_size, n_grids, seed=None):
-        self.grid_size = grid_size
-        self.world_size = world_size
-        self.voxel_size = world_size / grid_size
-        self.n_grids = n_grids
 
-        self._rotations = None
-        self._offsets = None
-        self._quats = None
-
-    def _halton_sequence(self, index, base):
-        result = 0.0
-        f = 1.0 / base
-        i = index
-        while i > 0:
-            result += f * (i % base)
-            i //= base
-            f /= base
-        return result
-
-    def generate_deterministic(self):
-        n = self.n_grids
-
-        start_idx = 100
-
-        u1 = np.array(
-            [self._halton_sequence(i, 2) for i in range(start_idx, start_idx + n)]
-        )
-        u2 = np.array(
-            [self._halton_sequence(i, 3) for i in range(start_idx, start_idx + n)]
-        )
-        u3 = np.array(
-            [self._halton_sequence(i, 5) for i in range(start_idx, start_idx + n)]
-        )
-
-        v1 = np.array(
-            [self._halton_sequence(i, 7) for i in range(start_idx, start_idx + n)]
-        )
-        v2 = np.array(
-            [self._halton_sequence(i, 11) for i in range(start_idx, start_idx + n)]
-        )
-        v3 = np.array(
-            [self._halton_sequence(i, 13) for i in range(start_idx, start_idx + n)]
-        )
-
-        sqrt_1_minus_u1 = np.sqrt(1 - u1)
-        sqrt_u1 = np.sqrt(u1)
-
-        q0 = sqrt_1_minus_u1 * np.sin(2 * np.pi * u2)
-        q1 = sqrt_1_minus_u1 * np.cos(2 * np.pi * u2)
-        q2 = sqrt_u1 * np.sin(2 * np.pi * u3)
-        q3 = sqrt_u1 * np.cos(2 * np.pi * u3)
-
-        self._quats = np.stack([q0, q1, q2, q3], axis=1).astype(np.float32)
-
-        self._offsets = np.stack([v1, v2, v3], axis=1).astype(np.float32)
-        self._offsets *= self.voxel_size
-
-        self._rotations = np.array([self._quat_to_matrix(q) for q in self._quats])
-
-        return self._rotations, self._offsets
-
-    def get_transforms(self, verbose=True):
-        if verbose:
-            print(
-                f"  Generating {self.n_grids} deterministic SE(3) transforms (6D Halton)..."
-            )
-        return self.generate_deterministic()
-
-    def analyze_coverage(self):
-        return
-        # if self._offsets is None:
-        #     return
-
-        # diff = self._offsets[:, None, :] - self._offsets[None, :, :]
-        # diff = diff - self.voxel_size * np.round(diff / self.voxel_size)
-        # off_dists = np.linalg.norm(diff, axis=2)
-        # np.fill_diagonal(off_dists, np.inf)
-        # min_off = np.min(off_dists)
-
-        # dot = np.abs(np.sum(self._quats[:, None, :] * self._quats[None, :, :], axis=2))
-        # np.clip(dot, 0, 1, out=dot)
-        # rot_dists = 2 * np.arccos(dot)
-        # np.fill_diagonal(rot_dists, np.inf)
-        # min_rot = np.min(rot_dists)
-
-        # combined_score = (off_dists / self.voxel_size) + (rot_dists / np.pi)
-        # min_combined = np.min(combined_score)
-
-    def _quat_to_matrix(self, q):
-        w, x, y, z = q
-        return np.array(
-            [
-                [
-                    1 - 2 * y * y - 2 * z * z,
-                    2 * x * y - 2 * z * w,
-                    2 * x * z + 2 * y * w,
-                    0.0,
-                ],
-                [
-                    2 * x * y + 2 * z * w,
-                    1 - 2 * x * x - 2 * z * z,
-                    2 * y * z - 2 * x * w,
-                    0.0,
-                ],
-                [
-                    2 * x * z - 2 * y * w,
-                    2 * y * z + 2 * x * w,
-                    1 - 2 * x * x - 2 * y * y,
-                    0.0,
-                ],
-                [0.0, 0.0, 0.0, 1.0],
-            ],
-            dtype=np.float32,
-        ).T[:3, :4]
 
 
 def set_uniform(prog, name, value):
@@ -262,10 +185,9 @@ class Simulation(mglw.WindowConfig):
         sampler = RandomSE3Sampler(
             grid_size=self.grid_size,
             world_size=self.world_size,
-            n_grids=self.n_grids,
-            seed=12345,
+            n_grids=self.n_grids
         )
-        rot_mats, offs = sampler.get_transforms(verbose=True)
+        rot_mats, offs = sampler.get_transforms()
 
         for i in range(self.n_grids):
             offsets[i, 0:3] = offs[i]
@@ -612,9 +534,9 @@ class Simulation(mglw.WindowConfig):
         positions = np.array(positions, dtype="f4")
         colors = np.array(colors, dtype="f4")
 
-        print(
-            f"Grid debug: {len(positions)} vertices for {n_to_draw} grids × {cells_per_axis}^3 cells"
-        )
+        # print(
+        #     f"Grid debug: {len(positions)} vertices for {n_to_draw} grids × {cells_per_axis}^3 cells"
+        # )
 
         pos_buf = self.ctx.buffer(positions.tobytes())
         color_buf = self.ctx.buffer(colors.tobytes())
@@ -739,11 +661,18 @@ class Simulation(mglw.WindowConfig):
         self.ctx.memory_barrier()
 
     def step(self):
+        # self.offsets, self.rotations = self.compute_transforms()
+        # self.offset_buf.write(self.offsets.tobytes())
+        # self.rotation_buf.write(self.rotations.tobytes())
         self.step_fft()
 
     def on_render(self, time, frame_time):
         if not self.paused:
             self.step()
+
+        if self.show_grid_debug:
+            self.init_grid_debug_geometry()
+
 
         self.ctx.clear(0.02, 0.02, 0.05)
         self.ctx.enable(moderngl.BLEND)

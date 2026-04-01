@@ -1,9 +1,3 @@
-// Linear-Sparse-Grid Green's Function Shader
-// Applies Green's function and spectral differentiation in Fourier space
-// For 2D: Z is batch dimension
-// For 3D: Packed layout (X, Y, Z*nGrids) - each grid's local Z for wave numbers
-// #version 460, DIM, N_GRIDS, GRID_SIZE injected by Python
-
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(location = 0) uniform int gridSize;
@@ -11,7 +5,6 @@ layout(location = 1) uniform int nGrids;
 layout(location = 2) uniform float G;
 layout(location = 3) uniform float worldSize;
 layout(location = 4) uniform float epsilon = 1e-1;
-// layout(location = 4) uniform float epsilon = 1e-1;
 
 layout(rg32f, binding = 0) readonly uniform image3D inputTexture;
 layout(rg32f, binding = 1) writeonly uniform image3D outGradX;
@@ -55,7 +48,7 @@ void main() {
   //   phiHat = rhoHat * (geoFactor * G / k2);
   // }
   float cellSize = worldSize / float(gridSize);
-  float a = cellSize * 0.5; // tune this: 0.5–2.0 cells
+  float a = cellSize * 0.6; // tune this: 0.5–2.0 cells
   float k2_soft = k2 + 1.0 / (a * a);
   phiHat = rhoHat * (geoFactor * G / k2_soft);
 
