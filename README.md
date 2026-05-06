@@ -103,6 +103,6 @@ damping: 0.999      # Velocity damping per step
 If you use this code, please cite the accompanying paper:
 
 ```
-Thomas Bailey (2026). Mixture of Grids (MOG): A Linear-Scaling Particle-Mesh
-Poisson Solver via Ensemble Grid Averaging. arXiv:[number]
+[Thomas Bailey (2026). Mixture of Grids (MOG): A Linear-Scaling Particle-Mesh
+Poisson Solver via Ensemble Grid Averaging.](paper.pdf)
 ```
