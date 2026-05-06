@@ -3,87 +3,114 @@ import moderngl
 import moderngl_window as mglw
 from pathlib import Path
 import yaml
-from scipy.stats import qmc # Quasi-Monte Carlo
+import subprocess
+import time
+from scipy.stats import qmc
+
+
+class VideoRecorder:
+    def __init__(self, width, height, fps=60, output="mog_simulation.mp4"):
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.output = output
+        self.proc = None
+
+    def start(self):
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-vcodec",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            f"{self.width}x{self.height}",
+            "-r",
+            str(self.fps),
+            "-i",
+            "pipe:0",
+            "-vcodec",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-crf",
+            "18",
+            self.output,
+        ]
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        print(f"Recording started -> {self.output}")
+
+    def write_frame(self, ctx):
+        data = ctx.screen.read(components=3)
+        arr = np.frombuffer(data, dtype=np.uint8).reshape(self.height, self.width, 3)
+        arr = np.flipud(arr)
+        self.proc.stdin.write(arr.tobytes())
+
+    def stop(self):
+        if self.proc:
+            self.proc.stdin.close()
+            self.proc.wait()
+            self.proc = None
+            print("Recording saved.")
+
 
 class RandomSE3Sampler:
-
     def __init__(self, grid_size, world_size, n_grids, seed=None):
-
         self.grid_size = grid_size
-
         self.world_size = world_size
-
         self.voxel_size = world_size / grid_size
-
         self.n_grids = n_grids
-
         self.seed = seed
 
-
-
     def generate(self):
-
         rng = np.random.default_rng(self.seed)
-
         n = self.n_grids
 
-
-
-        # Uniform random rotations via Shoemake method
-
         u = rng.uniform(0, 1, (n, 3))
-
         q0 = np.sqrt(1 - u[:, 0]) * np.sin(2 * np.pi * u[:, 1])
-
         q1 = np.sqrt(1 - u[:, 0]) * np.cos(2 * np.pi * u[:, 1])
-
-        q2 = np.sqrt(u[:, 0])     * np.sin(2 * np.pi * u[:, 2])
-
-        q3 = np.sqrt(u[:, 0])     * np.cos(2 * np.pi * u[:, 2])
-
+        q2 = np.sqrt(u[:, 0]) * np.sin(2 * np.pi * u[:, 2])
+        q3 = np.sqrt(u[:, 0]) * np.cos(2 * np.pi * u[:, 2])
         quats = np.stack([q0, q1, q2, q3], axis=1).astype(np.float32)
 
-
-
-        # Uniform random offsets within one voxel
-
         offsets = rng.uniform(0, self.voxel_size, (n, 3)).astype(np.float32)
-
-
-
         rotations = np.array([self._quat_to_matrix(q) for q in quats])
-
         return rotations, offsets
 
-
-
     def get_transforms(self, verbose=False):
-
         if verbose:
-
             print(f"  Generating {self.n_grids} random SE(3) transforms...")
-
         return self.generate()
 
-
-
     def _quat_to_matrix(self, q):
-
         w, x, y, z = q
-
-        return np.array([
-
-            [1-2*y*y-2*z*z,  2*x*y-2*z*w,    2*x*z+2*y*w,    0.],
-
-            [2*x*y+2*z*w,    1-2*x*x-2*z*z,  2*y*z-2*x*w,    0.],
-
-            [2*x*z-2*y*w,    2*y*z+2*x*w,    1-2*x*x-2*y*y,  0.],
-
-            [0.,             0.,             0.,             1.],
-
-        ], dtype=np.float32).T[:3, :4]
-
-
+        return np.array(
+            [
+                [
+                    1 - 2 * y * y - 2 * z * z,
+                    2 * x * y - 2 * z * w,
+                    2 * x * z + 2 * y * w,
+                    0.0,
+                ],
+                [
+                    2 * x * y + 2 * z * w,
+                    1 - 2 * x * x - 2 * z * z,
+                    2 * y * z - 2 * x * w,
+                    0.0,
+                ],
+                [
+                    2 * x * z - 2 * y * w,
+                    2 * y * z + 2 * x * w,
+                    1 - 2 * x * x - 2 * y * y,
+                    0.0,
+                ],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        ).T[:3, :4]
 
 
 def set_uniform(prog, name, value):
@@ -178,14 +205,24 @@ class Simulation(mglw.WindowConfig):
         print(f"  Equivalent single grid: {effective_res}^3 = {equiv_cells:,} cells")
         print(f"  Memory savings: {equiv_cells / total_cells:.1f}x")
 
+        # Recording
+        self.recorder = None
+        self.recording = False
+        if self.cfg.get("record", False):
+            w, h = self.wnd.size
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            output = self.cfg.get("record_output", f"mog_{timestamp}.mp4")
+            fps = int(self.cfg.get("record_fps", 60))
+            self.recorder = VideoRecorder(w, h, fps=fps, output=output)
+            self.recorder.start()
+            self.recording = True
+
     def compute_transforms(self):
         offsets = np.zeros((self.n_grids, 4), dtype="f4")
         rotations = np.zeros((self.n_grids, 12), dtype="f4")
 
         sampler = RandomSE3Sampler(
-            grid_size=self.grid_size,
-            world_size=self.world_size,
-            n_grids=self.n_grids
+            grid_size=self.grid_size, world_size=self.world_size, n_grids=self.n_grids
         )
         rot_mats, offs = sampler.get_transforms()
 
@@ -210,7 +247,8 @@ class Simulation(mglw.WindowConfig):
             "G": 1.0,
             "dt": 0.00001,
             "particle_mass": 1.0,
-            "solver": "convolution",
+            "solver": "fft",
+            "record": True,
         }
 
     def init_buffers(self):
@@ -321,7 +359,7 @@ class Simulation(mglw.WindowConfig):
         self.prog_init_particles["seed"] = int(seed)
         self.prog_init_particles["baseMass"] = float(self.cfg["particle_mass"])
         self.prog_init_particles["spawnBuffer"] = float(spawn_buffer)
-        self.prog_init_particles["spawnShape"] = 1  # Sphere
+        self.prog_init_particles["spawnShape"] = 1
 
         self.prog_init_particles.run((n_particles + 255) // 256)
         self.ctx.memory_barrier()
@@ -331,7 +369,6 @@ class Simulation(mglw.WindowConfig):
         )
 
     def init_particles2(self):
-        """Initialize two colliding galaxies."""
         pos = np.zeros((self.num_particles, 4), dtype="f4")
         vel = np.zeros((self.num_particles, 4), dtype="f4")
 
@@ -534,10 +571,6 @@ class Simulation(mglw.WindowConfig):
         positions = np.array(positions, dtype="f4")
         colors = np.array(colors, dtype="f4")
 
-        # print(
-        #     f"Grid debug: {len(positions)} vertices for {n_to_draw} grids × {cells_per_axis}^3 cells"
-        # )
-
         pos_buf = self.ctx.buffer(positions.tobytes())
         color_buf = self.ctx.buffer(colors.tobytes())
         self.grid_debug_vao = self.ctx.vertex_array(
@@ -581,7 +614,6 @@ class Simulation(mglw.WindowConfig):
         return curr_src
 
     def step_fft(self):
-        """Simulation step using FFT-based solver."""
         gs = self.grid_size
         ng = self.n_grids
         n_particles = self.num_particles
@@ -661,9 +693,6 @@ class Simulation(mglw.WindowConfig):
         self.ctx.memory_barrier()
 
     def step(self):
-        # self.offsets, self.rotations = self.compute_transforms()
-        # self.offset_buf.write(self.offsets.tobytes())
-        # self.rotation_buf.write(self.rotations.tobytes())
         self.step_fft()
 
     def on_render(self, time, frame_time):
@@ -672,7 +701,6 @@ class Simulation(mglw.WindowConfig):
 
         if self.show_grid_debug:
             self.init_grid_debug_geometry()
-
 
         self.ctx.clear(0.02, 0.02, 0.05)
         self.ctx.enable(moderngl.BLEND)
@@ -702,11 +730,16 @@ class Simulation(mglw.WindowConfig):
             self.grid_debug_prog["m_proj"].write(m_proj.tobytes())
             self.grid_debug_vao.render(moderngl.LINES)
 
+        if self.recording and self.recorder:
+            self.recorder.write_frame(self.ctx)
+
     def on_key_event(self, key, action, modifiers):
         keys = self.wnd.keys
 
         if action == keys.ACTION_PRESS:
             if key == keys.Q:
+                if self.recording and self.recorder:
+                    self.recorder.stop()
                 self.wnd.close()
 
             elif key == keys.R:
