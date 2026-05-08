@@ -152,8 +152,8 @@ def create_look_at(eye, target, up):
 class Simulation(mglw.WindowConfig):
     gl_version = (4, 6)
     title = "Linear-Sparse-Grid N-Body"
-    window_size = (1024, 1024)
-    aspect_ratio = 1.0
+    window_size = (2560, 1440)
+    aspect_ratio = window_size[0] / window_size[1]
     resizable = True
 
     def __init__(self, **kwargs):

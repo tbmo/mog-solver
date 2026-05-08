@@ -25,5 +25,7 @@
         "workbench.files.action.collapseExplorerFolders",
         "workbench.files.action.focusFilesExplorer"
     ],
-    "superkeys.dryrun": false
+    "superkeys.dryrun": false,
+    "python-envs.defaultEnvManager": "ms-python.python:conda",
+    "python-envs.defaultPackageManager": "ms-python.python:conda"
 }
