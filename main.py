@@ -43,9 +43,10 @@ class VideoRecorder:
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
         print(f"Recording started -> {self.output}")
 
-    def write_frame(self, ctx):
-        data = ctx.screen.read(components=3)
-        arr = np.frombuffer(data, dtype=np.uint8).reshape(self.height, self.width, 3)
+    def write_frame(self, ctx, wnd):
+        w, h = wnd.size
+        data = ctx.screen.read(viewport=(0, 0, w, h), components=3)
+        arr = np.frombuffer(data, dtype=np.uint8).reshape(h, w, 3)
         arr = np.flipud(arr)
         self.proc.stdin.write(arr.tobytes())
 
@@ -152,7 +153,7 @@ def create_look_at(eye, target, up):
 class Simulation(mglw.WindowConfig):
     gl_version = (4, 6)
     title = "Linear-Sparse-Grid N-Body"
-    window_size = (2560, 1440)
+    window_size = (1024, 1024)
     aspect_ratio = window_size[0] / window_size[1]
     resizable = True
 
@@ -731,7 +732,7 @@ class Simulation(mglw.WindowConfig):
             self.grid_debug_vao.render(moderngl.LINES)
 
         if self.recording and self.recorder:
-            self.recorder.write_frame(self.ctx)
+            self.recorder.write_frame(self.ctx, self.wnd)
 
     def on_key_event(self, key, action, modifiers):
         keys = self.wnd.keys
