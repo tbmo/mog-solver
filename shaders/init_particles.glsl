@@ -1,6 +1,3 @@
-// init_particles.glsl - GPU Perlin noise particle initialization
-// #version 460, DIM injected by Python
-
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) buffer PositionBuffer { vec4 positions[]; };
@@ -170,7 +167,9 @@ void main() {
       uint diskAttempts = 0u;
       do {
         // Generate point in [-1, 1]^2
-        diskPoint = rand2(particleSeed + attempts * 1000u + diskAttempts * 100u) * 2.0 - 1.0;
+        diskPoint =
+            rand2(particleSeed + attempts * 1000u + diskAttempts * 100u) * 2.0 -
+            1.0;
         diskAttempts++;
       } while (dot(diskPoint, diskPoint) > 1.0 && diskAttempts < 16u);
 
@@ -178,7 +177,8 @@ void main() {
       candidate = center + diskPoint * radius;
     } else {
       // Cube mode: uniform in spawn region
-      candidate = rand2(particleSeed + attempts * 1000u) * spawnRange + minBound;
+      candidate =
+          rand2(particleSeed + attempts * 1000u) * spawnRange + minBound;
     }
 
     // Sample density field using FBM
@@ -236,7 +236,10 @@ void main() {
       uint sphereAttempts = 0u;
       do {
         // Generate point in [-1, 1]^3
-        spherePoint = rand3(particleSeed + attempts * 1000u + sphereAttempts * 100u) * 2.0 - 1.0;
+        spherePoint =
+            rand3(particleSeed + attempts * 1000u + sphereAttempts * 100u) *
+                2.0 -
+            1.0;
         sphereAttempts++;
       } while (dot(spherePoint, spherePoint) > 1.0 && sphereAttempts < 16u);
 
@@ -244,7 +247,8 @@ void main() {
       candidate = center + spherePoint * radius;
     } else {
       // Cube mode: uniform in spawn region
-      candidate = rand3(particleSeed + attempts * 1000u) * spawnRange + minBound;
+      candidate =
+          rand3(particleSeed + attempts * 1000u) * spawnRange + minBound;
     }
 
     vec3 noiseCoord = candidate * noiseScale / worldSize;
@@ -268,11 +272,8 @@ void main() {
       float r = pow(rand(particleSeed), 1.0 / 3.0) * radius;
       float theta = rand(hash(particleSeed)) * 6.28318530718;
       float phi = acos(2.0 * rand(hash(hash(particleSeed))) - 1.0);
-      pos = center + vec3(
-          sin(phi) * cos(theta),
-          sin(phi) * sin(theta),
-          cos(phi)
-      ) * r;
+      pos = center +
+            vec3(sin(phi) * cos(theta), sin(phi) * sin(theta), cos(phi)) * r;
     } else {
       pos = rand3(particleSeed) * spawnRange + minBound;
     }

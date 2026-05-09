@@ -1,6 +1,3 @@
-// mass.glsl - NGP (nearest grid point) version
-// #version 460, DIM, N_GRIDS, GRID_SIZE injected by Python
-
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer PositionBuffer {

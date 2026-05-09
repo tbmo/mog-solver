@@ -12,7 +12,7 @@ damping: 0.998
 # Solver type: "convolution" (direct) or "fft" (spectral)
 # solver: convolution
 solver: fft
-record: True
+# record: True
 
 # Particle initialization
 spawn_buffer: 0.0       # Fraction of world_size to keep clear from edges (0.0-0.5)
