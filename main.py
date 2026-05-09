@@ -15,8 +15,15 @@ class VideoRecorder:
         self.fps = fps
         self.output = output
         self.proc = None
+        self.pbo = None
+        self.pbo_index = 0
+        self._pbo_ready = False
+        self._queue = None
+        self._thread = None
 
-    def start(self):
+    def start(self, ctx):  # <-- ctx passed in here now
+        import queue, threading
+
         cmd = [
             "ffmpeg",
             "-y",
@@ -41,16 +48,49 @@ class VideoRecorder:
             self.output,
         ]
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+
+        # Create two PBOs for ping-pong async readback
+        self.pbo = [ctx.buffer(reserve=self.width * self.height * 3) for _ in range(2)]
+        self.pbo_index = 0
+        self._pbo_ready = False
+
+        # Background writer thread so stdin.write() never blocks render
+        self._queue = queue.Queue(maxsize=4)
+        self._thread = threading.Thread(target=self._writer, daemon=True)
+        self._thread.start()
+
         print(f"Recording started -> {self.output}")
+
+    def _writer(self):
+        while True:
+            item = self._queue.get()
+            if item is None:
+                break
+            self.proc.stdin.write(item)
 
     def write_frame(self, ctx, wnd):
         w, h = wnd.size
-        data = ctx.screen.read(viewport=(0, 0, w, h), components=3)
-        arr = np.frombuffer(data, dtype=np.uint8).reshape(h, w, 3)
-        arr = np.flipud(arr)
-        self.proc.stdin.write(arr.tobytes())
+        cur = self.pbo_index
+        nxt = 1 - cur
+
+        # Read the frame that was downloaded last call (no GPU stall)
+        if self._pbo_ready:
+            data = self.pbo[nxt].read()
+            arr = np.frombuffer(data, dtype=np.uint8).reshape(h, w, 3)[::-1].tobytes()
+            try:
+                self._queue.put_nowait(arr)
+            except Exception:
+                pass  # drop frame rather than stall
+
+        # Kick off async download of current frame into cur PBO
+        ctx.screen.read_into(self.pbo[cur], viewport=(0, 0, w, h), components=3)
+        self.pbo_index = nxt
+        self._pbo_ready = True
 
     def stop(self):
+        if self._thread:
+            self._queue.put(None)
+            self._thread.join()
         if self.proc:
             self.proc.stdin.close()
             self.proc.wait()
@@ -153,7 +193,7 @@ def create_look_at(eye, target, up):
 class Simulation(mglw.WindowConfig):
     gl_version = (4, 6)
     title = "Linear-Sparse-Grid N-Body"
-    window_size = (1024, 1024)
+    window_size = (1024, 768)
     aspect_ratio = window_size[0] / window_size[1]
     resizable = True
 
@@ -215,7 +255,7 @@ class Simulation(mglw.WindowConfig):
             output = self.cfg.get("record_output", f"mog_{timestamp}.mp4")
             fps = int(self.cfg.get("record_fps", 60))
             self.recorder = VideoRecorder(w, h, fps=fps, output=output)
-            self.recorder.start()
+            self.recorder.start(self.ctx)
             self.recording = True
 
     def compute_transforms(self):
@@ -262,6 +302,10 @@ class Simulation(mglw.WindowConfig):
         cells_per_grid = self.grid_size**3
         total_cells = self.n_grids * cells_per_grid
         self.mass_buf = self.ctx.buffer(reserve=total_cells * 4)
+
+        w, h = self.wnd.size
+        self.pbo = [self.ctx.buffer(reserve=w * h * 3) for _ in range(2)]
+        self.pbo_index = 0
 
     def init_textures(self):
         gs = self.grid_size
@@ -338,7 +382,7 @@ class Simulation(mglw.WindowConfig):
         print(f"  Kernel buffer size: {kernel.nbytes / 1024:.1f} KB")
 
     def init_particles(self):
-        self.init_particles_gpu(noise_scale=4.0, density_contrast=2.0, seed=None)
+        self.init_particles_gpu(noise_scale=4.0, density_contrast=2.0, seed=12345)
 
     def init_particles_gpu(
         self, noise_scale=4.0, density_contrast=2.0, seed=None, spawn_buffer=None

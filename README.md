@@ -1,5 +1,5 @@
 # mog-solver
-[![Emergent Spiral Galaxies](images/spirals.png)](https://www.youtube.com/shorts/UNLWFJdiH0w)
+[![Emergent Spiral Galaxies](images/spirals.png)](https://www.youtube.com/watch?v=lfAW1pV1ae4)
 (click image for video)
 
 A GPU-accelerated N-body gravity simulator using the **Mixture of Grids (MOG)** algorithm.
