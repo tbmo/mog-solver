@@ -481,7 +481,11 @@ class Simulation(mglw.WindowConfig):
                 #version 460
                 out vec4 fragColor;
                 void main() {
-                    fragColor = vec4(1.0, 1.0, 1.0, 1.0);
+                    vec2 coord = gl_PointCoord * 2.0 - 1.0;
+                    float r = dot(coord, coord);
+                    if (r > 1.0) discard;
+                    float alpha = exp(-r * 3.0);
+                    fragColor = vec4(1.0, 1.0, 1.0, alpha);
                 }
                 """,
         )
