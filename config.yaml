@@ -15,4 +15,4 @@ solver: fft
 # record: True
 
 # Particle initialization
-spawn_buffer: 0.0       # Fraction of world_size to keep clear from edges (0.0-0.5)
+spawn_buffer: 0.25       # Fraction of world_size to keep clear from edges (0.0-0.5)

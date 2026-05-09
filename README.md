@@ -6,7 +6,7 @@ A GPU-accelerated N-body gravity simulator using the **Mixture of Grids (MOG)** 
 
 ## The Algorithm
 
-Traditional particle-mesh (PM) gravity solvers face a fundamental tradeoff: a single coarse grid is fast but produces blind spots (particles in the same cell exert no force on each other) and grid-aligned artifacts. A fine grid fixes this but memory and compute scale cubically with resolution — prohibitive in 3D.
+Traditional particle-mesh (PM) gravity solvers face a fundamental tradeoff: a single coarse grid is fast but produces blind spots (particles in the same cell exert no force on each other) and grid-aligned artifacts. A fine grid fixes this but memory and compute scale cubically with resolution prohibitive in 3D.
 
 MOG solves this by averaging forces across an ensemble of independently rotated and offset coarse grids. Particles that share a cell on one grid are separated on others. The ensemble average recovers sub-cell force resolution and eliminates grid artifacts, at a fraction of the memory cost of an equivalent fine grid.
 
