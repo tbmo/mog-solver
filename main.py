@@ -3,99 +3,7 @@ import moderngl
 import moderngl_window as mglw
 from pathlib import Path
 import yaml
-import subprocess
 import time
-from scipy.stats import qmc
-
-
-class VideoRecorder:
-    def __init__(self, width, height, fps=60, output="mog_simulation.mp4"):
-        self.width = width
-        self.height = height
-        self.fps = fps
-        self.output = output
-        self.proc = None
-        self.pbo = None
-        self.pbo_index = 0
-        self._pbo_ready = False
-        self._queue = None
-        self._thread = None
-
-    def start(self, ctx):  # <-- ctx passed in here now
-        import queue, threading
-
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-f",
-            "rawvideo",
-            "-vcodec",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "-s",
-            f"{self.width}x{self.height}",
-            "-r",
-            str(self.fps),
-            "-i",
-            "pipe:0",
-            "-vcodec",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-crf",
-            "18",
-            self.output,
-        ]
-        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-
-        # Create two PBOs for ping-pong async readback
-        self.pbo = [ctx.buffer(reserve=self.width * self.height * 3) for _ in range(2)]
-        self.pbo_index = 0
-        self._pbo_ready = False
-
-        # Background writer thread so stdin.write() never blocks render
-        self._queue = queue.Queue(maxsize=4)
-        self._thread = threading.Thread(target=self._writer, daemon=True)
-        self._thread.start()
-
-        print(f"Recording started -> {self.output}")
-
-    def _writer(self):
-        while True:
-            item = self._queue.get()
-            if item is None:
-                break
-            self.proc.stdin.write(item)
-
-    def write_frame(self, ctx, wnd):
-        w, h = wnd.size
-        cur = self.pbo_index
-        nxt = 1 - cur
-
-        # Read the frame that was downloaded last call (no GPU stall)
-        if self._pbo_ready:
-            data = self.pbo[nxt].read()
-            arr = np.frombuffer(data, dtype=np.uint8).reshape(h, w, 3)[::-1].tobytes()
-            try:
-                self._queue.put_nowait(arr)
-            except Exception:
-                pass  # drop frame rather than stall
-
-        # Kick off async download of current frame into cur PBO
-        ctx.screen.read_into(self.pbo[cur], viewport=(0, 0, w, h), components=3)
-        self.pbo_index = nxt
-        self._pbo_ready = True
-
-    def stop(self):
-        if self._thread:
-            self._queue.put(None)
-            self._thread.join()
-        if self.proc:
-            self.proc.stdin.close()
-            self.proc.wait()
-            self.proc = None
-            print("Recording saved.")
 
 
 class RandomSE3Sampler:
@@ -245,18 +153,6 @@ class Simulation(mglw.WindowConfig):
         print(f"  Total cells: {total_cells:,}")
         print(f"  Equivalent single grid: {effective_res}^3 = {equiv_cells:,} cells")
         print(f"  Memory savings: {equiv_cells / total_cells:.1f}x")
-
-        # Recording
-        self.recorder = None
-        self.recording = False
-        if self.cfg.get("record", False):
-            w, h = self.wnd.size
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            output = self.cfg.get("record_output", f"mog_{timestamp}.mp4")
-            fps = int(self.cfg.get("record_fps", 60))
-            self.recorder = VideoRecorder(w, h, fps=fps, output=output)
-            self.recorder.start(self.ctx)
-            self.recording = True
 
     def compute_transforms(self):
         offsets = np.zeros((self.n_grids, 4), dtype="f4")
@@ -524,7 +420,7 @@ class Simulation(mglw.WindowConfig):
         self.grid_debug_prog["world_size"] = self.world_size
         self.init_grid_debug_geometry()
 
-    def init_grid_debug_geometry(self, cells_per_axis=8, max_grids=1):
+    def init_grid_debug_geometry(self, cells_per_axis=16, max_grids=1):
         def hsv_to_rgb(h, s, v):
             i = int(h * 6)
             f = h * 6 - i
@@ -748,8 +644,9 @@ class Simulation(mglw.WindowConfig):
         if not self.paused:
             self.step()
 
-        if self.show_grid_debug:
-            self.init_grid_debug_geometry()
+        # only need to do this if the grid is moving
+        ## if self.show_grid_debug:
+        ### self.init_grid_debug_geometry()
 
         self.ctx.clear(0.02, 0.02, 0.05)
         self.ctx.enable(moderngl.BLEND)
@@ -779,16 +676,11 @@ class Simulation(mglw.WindowConfig):
             self.grid_debug_prog["m_proj"].write(m_proj.tobytes())
             self.grid_debug_vao.render(moderngl.LINES)
 
-        if self.recording and self.recorder:
-            self.recorder.write_frame(self.ctx, self.wnd)
-
     def on_key_event(self, key, action, modifiers):
         keys = self.wnd.keys
 
         if action == keys.ACTION_PRESS:
             if key == keys.Q:
-                if self.recording and self.recorder:
-                    self.recorder.stop()
                 self.wnd.close()
 
             elif key == keys.R:
@@ -839,11 +731,6 @@ class Simulation(mglw.WindowConfig):
                 self.use_convolution = not self.use_convolution
                 mode = "Direct Convolution" if self.use_convolution else "FFT"
                 print(f"Solver: {mode}")
-
-            elif key == keys.F:
-                from force_probe import probe_force_law_v2
-
-                probe_force_law_v2(self)
 
 
 if __name__ == "__main__":
