@@ -361,35 +361,66 @@ class Simulation(mglw.WindowConfig):
             vertex_shader="""
                 #version 460
                 layout(location = 0) in vec4 in_pos;
+                layout(location = 1) in vec4 in_vel;
 
                 uniform float world_size;
                 uniform mat4 m_proj;
                 uniform mat4 m_view;
 
+                uniform float speed_scale;
+                out float v_speed;
+
                 void main() {
                     vec3 p = (in_pos.xyz / world_size) * 2.0 - 1.0;
                     gl_Position = m_proj * m_view * vec4(p, 1.0);
+                    
                     float dist = gl_Position.w;
-                    gl_PointSize = 600.0 / (dist + 0.1);
+                    gl_PointSize = 800.0 / (dist + 0.1); 
+                    
+                    float speed = length(in_vel.xyz);
+                    
+                    v_speed = clamp(sqrt(speed) * speed_scale, 0.0, 1.0); 
                 }
-                """,
+        """,
             fragment_shader="""
                 #version 460
+                in float v_speed;
                 out vec4 fragColor;
+
+                vec3 getCosmicColor(float t) {
+                    vec3 col_cold = vec3(0.05, 0.1, 0.4); 
+                    vec3 col_mid  = vec3(0.6, 0.0, 0.7); 
+                    vec3 col_hot  = vec3(1.0, 0.4, 0.0); 
+                    vec3 col_core = vec3(1.0, 0.9, 0.7); 
+
+                    if (t < 0.3) {
+                        return mix(col_cold, col_mid, t / 0.3);
+                    } else if (t < 0.7) {
+                        return mix(col_mid, col_hot, (t - 0.3) / 0.4);
+                    } else {
+                        return mix(col_hot, col_core, (t - 0.7) / 0.3);
+                    }
+                }
+
                 void main() {
                     vec2 coord = gl_PointCoord * 2.0 - 1.0;
                     float r = dot(coord, coord);
                     if (r > 1.0) discard;
-                    float alpha = exp(-r * 3.0);
-                    fragColor = vec4(1.0, 1.0, 1.0, alpha);
+
+                    float alpha = exp(-r * 3.5); 
+
+                    vec3 baseColor = getCosmicColor(v_speed);
+                    
+                    fragColor = vec4(baseColor, alpha * 0.8);
                 }
                 """,
         )
         self.render_prog["world_size"] = self.world_size
+        self.render_prog["speed_scale"] = 0.0
         self.vao = self.ctx.vertex_array(
-            self.render_prog, [(self.pos_buf, "4f", "in_pos")]
+            self.render_prog,
+            [(self.pos_buf, "4f", "in_pos"), (self.vel_buf, "4f", "in_vel")],
         )
-
         self.grid_debug_prog = self.ctx.program(
             vertex_shader="""
                 #version 460
@@ -647,9 +678,10 @@ class Simulation(mglw.WindowConfig):
         # only need to do this if the grid is moving
         ## if self.show_grid_debug:
         ### self.init_grid_debug_geometry()
-
-        self.ctx.clear(0.02, 0.02, 0.05)
+        self.ctx.clear(0.01, 0.01, 0.02)  # Darker, slightly blue-tinted void space
         self.ctx.enable(moderngl.BLEND)
+
+        self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE)
 
         rad_x = np.radians(self.cam_rot_x)
         rad_y = np.radians(np.clip(self.cam_rot_y, -89, 89))
@@ -727,10 +759,15 @@ class Simulation(mglw.WindowConfig):
                 self.show_particles = not self.show_particles
                 print(f"Particle rendering: {'ON' if self.show_particles else 'OFF'}")
 
-            elif key == keys.C:
-                self.use_convolution = not self.use_convolution
-                mode = "Direct Convolution" if self.use_convolution else "FFT"
-                print(f"Solver: {mode}")
+            elif key == keys.UP:
+                self.render_prog["speed_scale"].value += 0.001
+                print(f"Speed Scale: {self.render_prog['speed_scale'].value:.2f}")
+
+            elif key == keys.DOWN:
+                self.render_prog["speed_scale"].value = max(
+                    0.001, self.render_prog["speed_scale"].value - 0.001
+                )
+                print(f"Speed Scale: {self.render_prog['speed_scale'].value:.2f}")
 
 
 if __name__ == "__main__":
