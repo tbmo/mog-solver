@@ -680,8 +680,7 @@ class Simulation(mglw.WindowConfig):
         ### self.init_grid_debug_geometry()
         self.ctx.clear(0.01, 0.01, 0.02)  # Darker, slightly blue-tinted void space
         self.ctx.enable(moderngl.BLEND)
-
-        self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE)
+        self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
 
         rad_x = np.radians(self.cam_rot_x)
         rad_y = np.radians(np.clip(self.cam_rot_y, -89, 89))

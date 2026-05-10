@@ -1,8 +1,8 @@
 # Linear-Sparse-Grid Configuration
 n_grids: 120            # Number of offset grids, should be a multiple of 24 because crystals or something
 grid_size: 16           # Base resolution per grid (16x16x16)
-world_size: 500.0
-num_particles: 1e6
+world_size: 2000.0
+num_particles: 3e6
 G: 10.0
 dt: 0.00001
 particle_mass: 1.0
