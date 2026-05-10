@@ -58,38 +58,6 @@ void main() {
   vec4 pData = positions[gID];
   vec4 vData = velocities[gID];
 
-#if DIM == 2
-  vec2 pos = pData.xy;
-  vec2 vel = vData.xy;
-  float mass = pData.w;
-
-  vec2 totalForce = vec2(0.0);
-
-  for (int gridIdx = 0; gridIdx < nGrids; gridIdx++) {
-    vec2 offset = offsets[gridIdx].xy;
-    mat2 rot = getRotation(gridIdx);
-
-    vec2 centered = pos - worldSize * 0.5;
-    vec2 rotated = rot * centered;
-    vec2 samplePos = rotated + worldSize * 0.5 - offset;
-    samplePos = mod(mod(samplePos, worldSize) + worldSize, worldSize);
-
-    vec2 gridForce = sampleForce2D(samplePos, gridIdx);
-    vec2 worldForce = transpose(rot) * gridForce;
-    totalForce += worldForce;
-  }
-
-  vec2 avgForce = totalForce / float(nGrids);
-
-  vel -= avgForce * deltaTime;
-  vel *= damping;
-  pos += vel * deltaTime;
-  pos = mod(pos, worldSize);
-
-  positions[gID] = vec4(pos, 0.0, mass);
-  velocities[gID] = vec4(vel, 0.0, 0.0);
-
-#else
   vec3 pos = pData.xyz;
   vec3 vel = vData.xyz;
   float mass = pData.w;
@@ -119,5 +87,4 @@ void main() {
 
   positions[gID] = vec4(pos, mass);
   velocities[gID] = vec4(vel, 0.0);
-#endif
 }

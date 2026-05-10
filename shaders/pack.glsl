@@ -17,24 +17,14 @@ void main() {
   if (any(greaterThanEqual(pos, texSize)))
     return;
 
-#if DIM == 2
-  float N = float(gridSize * gridSize);
-#else
   float N = float(gridSize * gridSize * gridSize);
-#endif
   float scale = 1.0 / N;
 
   float fx = imageLoad(realGradX, pos).x * scale;
   float fy = imageLoad(realGradY, pos).x * scale;
 
-#if DIM == 2
-  vec2 force = vec2(fx, fy);
-  float mag = length(force);
-  imageStore(finalForce, pos, vec4(force, 0.0, mag));
-#else
   float fz = imageLoad(realGradZ, pos).x * scale;
   vec3 force = vec3(fx, fy, fz);
   float mag = length(force);
   imageStore(finalForce, pos, vec4(force, mag));
-#endif
 }

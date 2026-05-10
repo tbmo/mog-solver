@@ -9,9 +9,7 @@ layout(location = 4) uniform float epsilon = 0.0001;
 layout(rg32f, binding = 0) readonly uniform image3D inputTexture;
 layout(rg32f, binding = 1) writeonly uniform image3D outGradX;
 layout(rg32f, binding = 2) writeonly uniform image3D outGradY;
-#if DIM == 3
 layout(rg32f, binding = 3) writeonly uniform image3D outGradZ;
-#endif
 
 const float PI = 3.14159265359;
 const float TWO_PI = 2.0 * PI;

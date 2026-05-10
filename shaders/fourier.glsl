@@ -12,17 +12,8 @@ void main() {
   if (any(greaterThanEqual(pos, texSize)))
     return;
 
-#if DIM == 2
-  // 2D: Zero DC at (0,0) for each grid slice
-  if (pos.x == 0 && pos.y == 0) {
-    imageStore(spectrumTex, pos, vec4(0.0, 0.0, 0.0, 0.0));
-  }
-#else
-  // 3D: Packed layout - zero DC at localZ=0 for each grid
-  // pos.z = gridIdx * gridSize + localZ, so DC is when localZ == 0
   int localZ = pos.z % gridSize;
   if (pos.x == 0 && pos.y == 0 && localZ == 0) {
     imageStore(spectrumTex, pos, vec4(0.0, 0.0, 0.0, 0.0));
   }
-#endif
 }
